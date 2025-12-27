@@ -1,0 +1,22 @@
+[package]
+name = "streamx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Stream extensions."
+
+[dependencies]
+async-broadcast = "0.7"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[lints.clippy]
+collapsible_else_if = "allow"
+disallowed_macros = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+module_inception = "allow"
+
+[dev-dependencies]
+lits = "0.3.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
