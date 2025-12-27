@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Stream extensions."
+repository = "https://github.com/vilicvane/streamx"
 
 [dependencies]
 async-broadcast = "0.7"
