@@ -3,26 +3,26 @@ use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::{
-  Arc,
+  Arc, Weak,
   atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
 
-struct Inner<S>
+struct Inner<T>
 where
-  S: Stream + Send + 'static,
-  S::Item: Clone + Send + 'static,
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
 {
-  sender: async_broadcast::Sender<S::Item>,
-  seed_receiver: StdMutex<Option<async_broadcast::Receiver<S::Item>>>,
-  source: tokio::sync::Mutex<Option<S>>,
+  sender: async_broadcast::Sender<T::Item>,
+  seed_receiver: StdMutex<Option<async_broadcast::Receiver<T::Item>>>,
+  source: tokio::sync::Mutex<Option<T>>,
   started: AtomicBool,
 }
 
-impl<S> Inner<S>
+impl<T> Inner<T>
 where
-  S: Stream + Send + 'static,
-  S::Item: Clone + Send + 'static,
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
 {
   fn start(self: &Arc<Self>) {
     if self.started.swap(true, Ordering::AcqRel) {
@@ -58,19 +58,32 @@ where
 /// - Requires `Item: Clone` because `async_broadcast` delivers a cloned item per receiver.
 /// - The upstream is started lazily on the first poll of any `SharedStream`.
 /// - If all receivers are dropped, the upstream task stops (it cannot be restarted).
-pub struct SharedStream<S>
+pub struct SharedStream<T>
 where
-  S: Stream + Send + 'static,
-  S::Item: Clone + Send + 'static,
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
 {
-  inner: Arc<Inner<S>>,
-  receiver: Option<async_broadcast::Receiver<S::Item>>,
+  inner: Arc<Inner<T>>,
+  receiver: Option<async_broadcast::Receiver<T::Item>>,
 }
 
-impl<S> Clone for SharedStream<S>
+impl<T> SharedStream<T>
 where
-  S: Stream + Send + 'static,
-  S::Item: Clone + Send + 'static,
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  /// Create a weak handle that does not keep the shared stream alive.
+  pub fn downgrade(&self) -> SharedStreamWeak<T> {
+    SharedStreamWeak {
+      inner: Arc::downgrade(&self.inner),
+    }
+  }
+}
+
+impl<T> Clone for SharedStream<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
 {
   fn clone(&self) -> Self {
     Self {
@@ -80,12 +93,12 @@ where
   }
 }
 
-impl<S> Stream for SharedStream<S>
+impl<T> Stream for SharedStream<T>
 where
-  S: Stream + Send + 'static,
-  S::Item: Clone + Send + 'static,
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
 {
-  type Item = S::Item;
+  type Item = T::Item;
 
   fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     if self.receiver.is_none() {
@@ -110,6 +123,48 @@ where
         .expect("receiver must be initialized."),
     )
     .poll_next(cx)
+  }
+}
+
+/// A weak handle to a `SharedStream`.
+///
+/// This behaves similarly to `std::sync::Weak`: it can be upgraded to a new
+/// `SharedStream` while the underlying shared state is still alive, but does
+/// not keep that state alive on its own.
+pub struct SharedStreamWeak<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  inner: Weak<Inner<T>>,
+}
+
+impl<T> Clone for SharedStreamWeak<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  fn clone(&self) -> Self {
+    Self {
+      inner: Weak::clone(&self.inner),
+    }
+  }
+}
+
+impl<T> SharedStreamWeak<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  /// Attempt to upgrade to a strong `SharedStream`.
+  ///
+  /// Returns `None` if all strong handles have been dropped and the shared
+  /// stream has been deallocated.
+  pub fn upgrade(&self) -> Option<SharedStream<T>> {
+    self.inner.upgrade().map(|inner| SharedStream {
+      inner,
+      receiver: None,
+    })
   }
 }
 
@@ -307,5 +362,27 @@ mod tests {
       after, after2,
       "upstream kept being consumed after all receivers were dropped"
     );
+  }
+
+  #[tokio::test]
+  async fn weak_can_upgrade_to_shared_stream() {
+    let shared = futures::stream::iter([1_u32, 2, 3]).share();
+    let weak = shared.downgrade();
+
+    let upgraded = weak.upgrade().expect("shared stream should be alive");
+    drop(shared);
+
+    let collected = upgraded.collect::<Vec<_>>().await;
+    assert_eq!(collected, vec![1, 2, 3]);
+  }
+
+  #[test]
+  fn weak_does_not_keep_shared_stream_alive() {
+    let weak = {
+      let shared = futures::stream::empty::<u32>().share();
+      shared.downgrade()
+    };
+
+    assert!(weak.upgrade().is_none());
   }
 }

@@ -1,3 +1,3 @@
 pub mod share;
 
-pub use share::{SharedStream, StreamShareExt};
+pub use share::*;
