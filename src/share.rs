@@ -1,7 +1,7 @@
 use futures::Stream;
 use futures::StreamExt;
 use std::pin::Pin;
-use std::sync::Mutex as StdMutex;
+use std::sync::Mutex;
 use std::sync::{
   Arc, Weak,
   atomic::{AtomicBool, Ordering},
@@ -14,7 +14,7 @@ where
   T::Item: Clone + Send + 'static,
 {
   sender: async_broadcast::Sender<T::Item>,
-  seed_receiver: StdMutex<Option<async_broadcast::Receiver<T::Item>>>,
+  seed_receiver: Mutex<Option<async_broadcast::Receiver<T::Item>>>,
   source: tokio::sync::Mutex<Option<T>>,
   started: AtomicBool,
 }
@@ -192,7 +192,7 @@ where
 
     let inner = Arc::new(Inner {
       sender,
-      seed_receiver: StdMutex::new(Some(receiver)),
+      seed_receiver: Mutex::new(Some(receiver)),
       source: tokio::sync::Mutex::new(Some(self)),
       started: AtomicBool::new(false),
     });
