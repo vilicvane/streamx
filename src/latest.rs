@@ -54,22 +54,14 @@ pub trait StreamLatestExt: Stream + Sized {
   ///
   /// ```
   /// use futures::StreamExt;
+  /// use futures::executor::block_on;
   /// use streamx::StreamLatestExt;
   ///
-  /// # tokio_test::block_on(async {
-  /// let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+  /// let mut latest = futures::stream::iter([1_u32, 2, 3]).latest();
   ///
-  /// // Send multiple values before polling
-  /// tx.send(1).unwrap();
-  /// tx.send(2).unwrap();
-  /// tx.send(3).unwrap();
-  ///
-  /// let mut latest = streamx::wrap_receiver(rx).latest();
-  ///
-  /// // Only the latest value (3) will be returned
-  /// let value = latest.next().await;
+  /// // The iterator is immediately ready, so only the latest value (3) is returned.
+  /// let value = block_on(async { latest.next().await });
   /// assert_eq!(value, Some(3));
-  /// # });
   /// ```
   fn latest(self) -> LatestStream<Self> {
     LatestStream {
