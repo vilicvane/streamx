@@ -20,4 +20,4 @@ module_inception = "allow"
 
 [dev-dependencies]
 lits = "0.3.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["full"] }
