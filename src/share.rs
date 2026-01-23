@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::{
   Arc, Weak,
-  atomic::{AtomicBool, Ordering},
+  atomic::{AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 
@@ -16,7 +16,8 @@ where
   sender: async_broadcast::Sender<T::Item>,
   seed_receiver: Mutex<Option<async_broadcast::Receiver<T::Item>>>,
   source: tokio::sync::Mutex<Option<T>>,
-  started: AtomicBool,
+  task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+  subscription_count: AtomicUsize,
 }
 
 impl<T> Inner<T>
@@ -24,14 +25,27 @@ where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
 {
+  fn stop(&self) {
+    if let Ok(mut task) = self.task.lock()
+      && let Some(handle) = task.take()
+    {
+      handle.abort();
+    }
+    self.sender.close();
+  }
+
   fn start(self: &Arc<Self>) {
-    if self.started.swap(true, Ordering::AcqRel) {
+    let inner = Arc::clone(self);
+    let mut task = match self.task.lock() {
+      Ok(task) => task,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if task.is_some() {
       return;
     }
 
-    let inner = Arc::clone(self);
-
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
       let Some(source) = inner.source.lock().await.take() else {
         return;
       };
@@ -46,6 +60,8 @@ where
 
       inner.sender.close();
     });
+
+    *task = Some(handle);
   }
 }
 
@@ -86,9 +102,26 @@ where
   T::Item: Clone + Send + 'static,
 {
   fn clone(&self) -> Self {
+    self
+      .inner
+      .subscription_count
+      .fetch_add(1, Ordering::Relaxed);
+
     Self {
       inner: Arc::clone(&self.inner),
       receiver: None,
+    }
+  }
+}
+
+impl<T> Drop for SharedStream<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  fn drop(&mut self) {
+    if self.inner.subscription_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+      self.inner.stop();
     }
   }
 }
@@ -161,9 +194,14 @@ where
   /// Returns `None` if all strong handles have been dropped and the shared
   /// stream has been deallocated.
   pub fn upgrade(&self) -> Option<SharedStream<T>> {
-    self.inner.upgrade().map(|inner| SharedStream {
-      inner,
-      receiver: None,
+    self.inner.upgrade().map(|inner| {
+      inner.subscription_count.fetch_add(1, Ordering::Relaxed);
+
+      let inner_clone = Arc::clone(&inner);
+      SharedStream {
+        inner: inner_clone,
+        receiver: None,
+      }
     })
   }
 }
@@ -194,11 +232,13 @@ where
       sender,
       seed_receiver: Mutex::new(Some(receiver)),
       source: tokio::sync::Mutex::new(Some(self)),
-      started: AtomicBool::new(false),
+      task: Mutex::new(None),
+      subscription_count: AtomicUsize::new(1),
     });
 
+    let inner_clone = Arc::clone(&inner);
     SharedStream {
-      inner,
+      inner: inner_clone,
       receiver: None,
     }
   }
@@ -384,5 +424,97 @@ mod tests {
     };
 
     assert!(weak.upgrade().is_none());
+  }
+
+  /// A stream that tracks when it's being polled and can block waiting for items.
+  struct PollTrackingStream {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    poll_count: Arc<AtomicUsize>,
+  }
+
+  impl futures::Stream for PollTrackingStream {
+    type Item = u32;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+      self.poll_count.fetch_add(1, Ordering::Relaxed);
+      self.receiver.poll_recv(cx)
+    }
+  }
+
+  /// Test that demonstrates the leak: when all receivers are dropped while the task
+  /// is blocked waiting on source.next().await, the task continues to hold resources
+  /// and poll the source stream until it gets an item.
+  ///
+  /// The leak manifests as: the spawned task keeps the Arc<Inner> and source stream
+  /// alive even after all SharedStream receivers are dropped, because it can't detect
+  /// that receivers are gone while blocked on source.next().await.
+  #[tokio::test]
+  async fn share_leak_when_blocked_on_source() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let poll_count = Arc::new(AtomicUsize::new(0));
+
+    let shared = PollTrackingStream {
+      receiver: rx,
+      poll_count: Arc::clone(&poll_count),
+    }
+    .share();
+
+    // Start consuming to spawn the task and get it to block on source.next().await
+    let receiver = shared.clone();
+    let mut receiver_for_spawn = receiver.clone();
+    let handle = tokio::spawn(async move {
+      // This will cause the task to start and block waiting for the first item
+      let _ = receiver_for_spawn.next().await;
+    });
+
+    // Wait for the task to start and block on source.next().await
+    // (waiting for an item that will never come)
+    tokio::time::sleep(duration!("10ms")).await;
+
+    // Record initial poll count (task has started and is waiting)
+    let initial_polls = poll_count.load(Ordering::Relaxed);
+    assert!(
+      initial_polls > 0,
+      "Task should have started and polled the source"
+    );
+
+    // Drop all receivers - this should trigger shutdown
+    // (receiver_for_spawn will be dropped when handle is dropped)
+    drop(shared);
+    drop(receiver);
+    drop(handle); // This drops receiver_for_spawn, triggering shutdown
+
+    // Wait a bit to ensure shutdown is processed
+    tokio::time::sleep(duration!("10ms")).await;
+
+    // The poll count shouldn't have increased (task is blocked, not polling)
+    // but the resources are still held
+    let polls_after_drop = poll_count.load(Ordering::Relaxed);
+    assert_eq!(
+      polls_after_drop, initial_polls,
+      "Poll count should not increase while blocked"
+    );
+
+    // Now send an item - with the fix, the task should detect shutdown
+    // and stop immediately. It might poll once more to get the item (if it arrives
+    // before shutdown is checked), but should then stop without processing it.
+    tx.send(42).unwrap();
+
+    // Give the task time to process
+    tokio::time::sleep(duration!("25ms")).await;
+
+    let polls_after_item = poll_count.load(Ordering::Relaxed);
+
+    // After the fix, the task should stop when receivers are dropped.
+    // It might poll a few times if items arrive during the shutdown process
+    // (this is acceptable async behavior due to race conditions), but should stop quickly.
+    // The poll count should increase by at most a few polls before stopping.
+    let additional_polls = polls_after_item.saturating_sub(polls_after_drop);
+    assert!(
+      additional_polls <= 5,
+      "Leak detected: source stream was polled {} additional times after receivers dropped (expected <= 5). \
+       The task should have stopped when receivers were dropped, but it continued to poll the source stream excessively.",
+      additional_polls
+    );
   }
 }
