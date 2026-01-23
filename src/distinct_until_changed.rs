@@ -264,8 +264,8 @@ mod tests {
 
   #[tokio::test]
   async fn distinct_until_changed_by_uses_custom_comparison() {
-    let mut stream = futures::stream::iter([1, 2, 3, 4, 5])
-      .distinct_until_changed_by(|a, b| a % 2 == b % 2);
+    let mut stream =
+      futures::stream::iter([1, 2, 3, 4, 5]).distinct_until_changed_by(|a, b| a % 2 == b % 2);
 
     // Should emit when parity changes
     assert_eq!(stream.next().await, Some(1)); // odd
