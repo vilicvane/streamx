@@ -4,7 +4,7 @@ use futures::{FutureExt, future::BoxFuture};
 
 pub enum Scheduler {
   Duration(Duration),
-  AsyncFn(Box<dyn Fn() -> BoxFuture<'static, ()>>),
+  AsyncFn(Box<dyn Fn() -> BoxFuture<'static, ()> + Send>),
 }
 
 impl Scheduler {
@@ -24,7 +24,7 @@ impl From<Duration> for Scheduler {
 
 impl<TFunction, TFuture> From<TFunction> for Scheduler
 where
-  TFunction: Fn() -> TFuture + 'static,
+  TFunction: Fn() -> TFuture + Send + 'static,
   TFuture: Future<Output = ()> + Send + 'static,
 {
   fn from(function: TFunction) -> Self {
