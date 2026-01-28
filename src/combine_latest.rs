@@ -19,25 +19,25 @@ use futures::Stream;
 #[macro_export]
 macro_rules! combine_latest {
   ($a:expr, $b:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest2Stream::new($a, $b)
+    $crate::CombineLatest2Stream::new($a, $b)
   };
   ($a:expr, $b:expr, $c:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest3Stream::new($a, $b, $c)
+    $crate::CombineLatest3Stream::new($a, $b, $c)
   };
   ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest4Stream::new($a, $b, $c, $d)
+    $crate::CombineLatest4Stream::new($a, $b, $c, $d)
   };
   ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest5Stream::new($a, $b, $c, $d, $e)
+    $crate::CombineLatest5Stream::new($a, $b, $c, $d, $e)
   };
   ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest6Stream::new($a, $b, $c, $d, $e, $f)
+    $crate::CombineLatest6Stream::new($a, $b, $c, $d, $e, $f)
   };
   ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest7Stream::new($a, $b, $c, $d, $e, $f, $g)
+    $crate::CombineLatest7Stream::new($a, $b, $c, $d, $e, $f, $g)
   };
   ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr $(,)?) => {
-    $crate::combine_latest::CombineLatest8Stream::new($a, $b, $c, $d, $e, $f, $g, $h)
+    $crate::CombineLatest8Stream::new($a, $b, $c, $d, $e, $f, $g, $h)
   };
 }
 
