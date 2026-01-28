@@ -13,6 +13,7 @@ AI-curated stream utilities for Rust.
 
 ## Pipe
 
+- [debounce](src/debounce.rs)
 - [distinct_until_changed](src/distinct_until_changed.rs)
 - [latest](src/latest.rs)
 - [share](src/share.rs)
