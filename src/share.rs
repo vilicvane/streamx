@@ -72,9 +72,9 @@ where
 ///
 /// Notes:
 /// - Requires `Item: Clone` because `async_broadcast` delivers a cloned item per receiver.
-/// - The upstream is started lazily on the first poll of any `SharedStream`.
+/// - The upstream is started lazily on the first poll of any `ShareStream`.
 /// - If all receivers are dropped, the upstream task stops (it cannot be restarted).
-pub struct SharedStream<T>
+pub struct ShareStream<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -83,20 +83,20 @@ where
   receiver: Option<async_broadcast::Receiver<T::Item>>,
 }
 
-impl<T> SharedStream<T>
+impl<T> ShareStream<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
 {
   /// Create a weak handle that does not keep the shared stream alive.
-  pub fn downgrade(&self) -> SharedStreamWeak<T> {
-    SharedStreamWeak {
+  pub fn downgrade(&self) -> ShareStreamWeak<T> {
+    ShareStreamWeak {
       inner: Arc::downgrade(&self.inner),
     }
   }
 }
 
-impl<T> Clone for SharedStream<T>
+impl<T> Clone for ShareStream<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -114,7 +114,7 @@ where
   }
 }
 
-impl<T> Drop for SharedStream<T>
+impl<T> Drop for ShareStream<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -126,7 +126,7 @@ where
   }
 }
 
-impl<T> Stream for SharedStream<T>
+impl<T> Stream for ShareStream<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -159,12 +159,12 @@ where
   }
 }
 
-/// A weak handle to a `SharedStream`.
+/// A weak handle to a `ShareStream`.
 ///
 /// This behaves similarly to `std::sync::Weak`: it can be upgraded to a new
-/// `SharedStream` while the underlying shared state is still alive, but does
+/// `ShareStream` while the underlying shared state is still alive, but does
 /// not keep that state alive on its own.
-pub struct SharedStreamWeak<T>
+pub struct ShareStreamWeak<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -172,7 +172,7 @@ where
   inner: Weak<Inner<T>>,
 }
 
-impl<T> Clone for SharedStreamWeak<T>
+impl<T> Clone for ShareStreamWeak<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
@@ -184,21 +184,21 @@ where
   }
 }
 
-impl<T> SharedStreamWeak<T>
+impl<T> ShareStreamWeak<T>
 where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
 {
-  /// Attempt to upgrade to a strong `SharedStream`.
+  /// Attempt to upgrade to a strong `ShareStream`.
   ///
   /// Returns `None` if all strong handles have been dropped and the shared
   /// stream has been deallocated.
-  pub fn upgrade(&self) -> Option<SharedStream<T>> {
+  pub fn upgrade(&self) -> Option<ShareStream<T>> {
     self.inner.upgrade().map(|inner| {
       inner.subscription_count.fetch_add(1, Ordering::Relaxed);
 
       let inner_clone = Arc::clone(&inner);
-      SharedStream {
+      ShareStream {
         inner: inner_clone,
         receiver: None,
       }
@@ -215,12 +215,12 @@ where
   /// Share the upstream stream across multiple subscribers (clones), using a broadcast channel.
   ///
   /// Equivalent to `share_with_capacity(16)`.
-  fn share(self) -> SharedStream<Self> {
+  fn share(self) -> ShareStream<Self> {
     self.share_with_capacity(16)
   }
 
   /// Like `share()`, but with a custom channel capacity.
-  fn share_with_capacity(self, capacity: usize) -> SharedStream<Self> {
+  fn share_with_capacity(self, capacity: usize) -> ShareStream<Self> {
     let (mut sender, receiver) = async_broadcast::broadcast(capacity);
 
     // Wait for at least one receiver to be actively polled before sending.
@@ -237,7 +237,7 @@ where
     });
 
     let inner_clone = Arc::clone(&inner);
-    SharedStream {
+    ShareStream {
       inner: inner_clone,
       receiver: None,
     }
@@ -446,7 +446,7 @@ mod tests {
   /// and poll the source stream until it gets an item.
   ///
   /// The leak manifests as: the spawned task keeps the Arc<Inner> and source stream
-  /// alive even after all SharedStream receivers are dropped, because it can't detect
+  /// alive even after all ShareStream receivers are dropped, because it can't detect
   /// that receivers are gone while blocked on source.next().await.
   #[tokio::test]
   async fn share_leak_when_blocked_on_source() {
