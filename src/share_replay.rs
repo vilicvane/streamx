@@ -260,31 +260,59 @@ where
   }
 }
 
+fn create_share_replay_stream<T>(
+  source: T,
+  buffer_size: usize,
+  capacity: usize,
+  overflow: bool,
+) -> ShareReplayStream<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  let (mut sender, receiver) = async_broadcast::broadcast(capacity);
+
+  sender.set_await_active(true);
+  sender.set_overflow(overflow);
+
+  ShareReplayStream {
+    inner: Arc::new(Inner {
+      sender,
+      seed_receiver: Mutex::new(Some(receiver)),
+      source: tokio::sync::Mutex::new(Some(source)),
+      task: Mutex::new(None),
+      subscription_count: AtomicUsize::new(1),
+      replay_buffer: Mutex::new(VecDeque::new()),
+      replay_buffer_size: buffer_size,
+      sequence: AtomicU64::new(0),
+    }),
+    receiver: None,
+    replay_queue: VecDeque::new(),
+    replay_max_sequence: None,
+  }
+}
+
 pub trait StreamShareReplayExt: Stream + Sized
 where
   Self: Send + 'static,
   Self::Item: Clone + Send + 'static,
 {
   fn share_replay(self, buffer_size: usize, capacity: usize) -> ShareReplayStream<Self> {
-    let (mut sender, receiver) = async_broadcast::broadcast(capacity);
+    create_share_replay_stream(self, buffer_size, capacity, false)
+  }
 
-    sender.set_await_active(true);
+  /// Like `share_replay()`, but uses overflow mode to drop oldest queued values when full.
+  ///
+  /// Replay for late subscribers remains bounded by `buffer_size`.
+  fn share_replay_overflow(self, buffer_size: usize, capacity: usize) -> ShareReplayStream<Self> {
+    create_share_replay_stream(self, buffer_size, capacity, true)
+  }
 
-    ShareReplayStream {
-      inner: Arc::new(Inner {
-        sender,
-        seed_receiver: Mutex::new(Some(receiver)),
-        source: tokio::sync::Mutex::new(Some(self)),
-        task: Mutex::new(None),
-        subscription_count: AtomicUsize::new(1),
-        replay_buffer: Mutex::new(VecDeque::new()),
-        replay_buffer_size: buffer_size,
-        sequence: AtomicU64::new(0),
-      }),
-      receiver: None,
-      replay_queue: VecDeque::new(),
-      replay_max_sequence: None,
-    }
+  /// Replay + latest mode.
+  ///
+  /// This is equivalent to `share_replay_overflow(buffer_size, 1)`.
+  fn share_replay_latest(self, buffer_size: usize) -> ShareReplayStream<Self> {
+    self.share_replay_overflow(buffer_size, 1)
   }
 }
 
@@ -386,6 +414,37 @@ mod tests {
     drop(tx);
     assert_eq!(late.next().await, None);
     assert_eq!(first.next().await, None);
+  }
+
+  #[tokio::test]
+  async fn share_replay_overflow_replays_and_drops_for_lagging_subscribers() {
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_replay_overflow(2, 1);
+
+    let slow = shared.clone();
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let slow_values = slow.collect::<Vec<_>>().await;
+    let late = shared.clone();
+    let late_values = late.collect::<Vec<_>>().await;
+
+    assert_eq!(slow_values, vec![5]);
+    assert_eq!(late_values, vec![4, 5]);
+  }
+
+  #[tokio::test]
+  async fn share_replay_latest_is_alias_of_overflow_capacity_one() {
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_replay_latest(2);
+    let slow = shared.clone();
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let slow_values = slow.collect::<Vec<_>>().await;
+    let late = shared.clone();
+    let late_values = late.collect::<Vec<_>>().await;
+
+    assert_eq!(slow_values, vec![5]);
+    assert_eq!(late_values, vec![4, 5]);
   }
 
   #[tokio::test]

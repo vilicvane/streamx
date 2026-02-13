@@ -206,6 +206,33 @@ where
   }
 }
 
+fn create_share_stream<T>(source: T, capacity: usize, overflow: bool) -> ShareStream<T>
+where
+  T: Stream + Send + 'static,
+  T::Item: Clone + Send + 'static,
+{
+  let (mut sender, receiver) = async_broadcast::broadcast(capacity);
+
+  // Wait for at least one receiver to be actively polled before sending.
+  // This avoids immediately failing/dropping items when the first subscriber hasn't yet
+  // started polling.
+  sender.set_await_active(true);
+  sender.set_overflow(overflow);
+
+  let inner = Arc::new(Inner {
+    sender,
+    seed_receiver: Mutex::new(Some(receiver)),
+    source: tokio::sync::Mutex::new(Some(source)),
+    task: Mutex::new(None),
+    subscription_count: AtomicUsize::new(1),
+  });
+
+  ShareStream {
+    inner: Arc::clone(&inner),
+    receiver: None,
+  }
+}
+
 /// Share-related stream extensions (e.g. `share()`).
 pub trait StreamShareExt: Stream + Sized
 where
@@ -216,26 +243,22 @@ where
   ///
   /// The `capacity` controls channel buffering and lag/backpressure behavior.
   fn share(self, capacity: usize) -> ShareStream<Self> {
-    let (mut sender, receiver) = async_broadcast::broadcast(capacity);
+    create_share_stream(self, capacity, false)
+  }
 
-    // Wait for at least one receiver to be actively polled before sending.
-    // This avoids immediately failing/dropping items when the first subscriber hasn't yet
-    // started polling.
-    sender.set_await_active(true);
+  /// Like `share()`, but uses overflow mode to drop oldest queued values when full.
+  ///
+  /// This avoids global backpressure from lagging subscribers at the cost of silent drops.
+  fn share_overflow(self, capacity: usize) -> ShareStream<Self> {
+    create_share_stream(self, capacity, true)
+  }
 
-    let inner = Arc::new(Inner {
-      sender,
-      seed_receiver: Mutex::new(Some(receiver)),
-      source: tokio::sync::Mutex::new(Some(self)),
-      task: Mutex::new(None),
-      subscription_count: AtomicUsize::new(1),
-    });
-
-    let inner_clone = Arc::clone(&inner);
-    ShareStream {
-      inner: inner_clone,
-      receiver: None,
-    }
+  /// Share in latest mode.
+  ///
+  /// This is equivalent to `share_overflow(1)`: each subscriber gets the newest queued value
+  /// when lagging, and intermediate values may be dropped silently.
+  fn share_latest(self) -> ShareStream<Self> {
+    self.share_overflow(1)
   }
 }
 
@@ -274,6 +297,30 @@ mod tests {
 
     assert_eq!(va, vec![1, 2, 3, 4, 5]);
     assert_eq!(vb, vec![1, 2, 3, 4, 5]);
+  }
+
+  #[tokio::test]
+  async fn share_overflow_drops_oldest_for_lagging_subscribers() {
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_overflow(1);
+
+    let slow = shared.clone();
+
+    // Let upstream run before the slow subscriber starts polling.
+    tokio::time::sleep(duration!("10ms")).await;
+
+    let slow_values = slow.collect::<Vec<_>>().await;
+    assert_eq!(slow_values, vec![5]);
+  }
+
+  #[tokio::test]
+  async fn share_latest_is_alias_of_share_overflow_capacity_one() {
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_latest();
+    let slow = shared.clone();
+
+    tokio::time::sleep(duration!("10ms")).await;
+
+    let slow_values = slow.collect::<Vec<_>>().await;
+    assert_eq!(slow_values, vec![5]);
   }
 
   struct CountingStream {
