@@ -310,9 +310,9 @@ where
 
   /// Replay + latest mode.
   ///
-  /// This is equivalent to `share_replay_overflow(buffer_size, 1)`.
-  fn share_replay_latest(self, buffer_size: usize) -> ShareReplayStream<Self> {
-    self.share_replay_overflow(buffer_size, 1)
+  /// This is equivalent to `share_replay_overflow(1, 1)`.
+  fn share_replay_latest(self) -> ShareReplayStream<Self> {
+    self.share_replay_overflow(1, 1)
   }
 }
 
@@ -434,7 +434,7 @@ mod tests {
 
   #[tokio::test]
   async fn share_replay_latest_is_alias_of_overflow_capacity_one() {
-    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_replay_latest(2);
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share_replay_latest();
     let slow = shared.clone();
 
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -444,7 +444,7 @@ mod tests {
     let late_values = late.collect::<Vec<_>>().await;
 
     assert_eq!(slow_values, vec![5]);
-    assert_eq!(late_values, vec![4, 5]);
+    assert_eq!(late_values, vec![5]);
   }
 
   #[tokio::test]
