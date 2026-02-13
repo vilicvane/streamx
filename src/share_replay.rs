@@ -265,15 +265,7 @@ where
   Self: Send + 'static,
   Self::Item: Clone + Send + 'static,
 {
-  fn share_replay(self, buffer_size: usize) -> ShareReplayStream<Self> {
-    self.share_replay_with_capacity(buffer_size, 16)
-  }
-
-  fn share_replay_with_capacity(
-    self,
-    buffer_size: usize,
-    capacity: usize,
-  ) -> ShareReplayStream<Self> {
+  fn share_replay(self, buffer_size: usize, capacity: usize) -> ShareReplayStream<Self> {
     let (mut sender, receiver) = async_broadcast::broadcast(capacity);
 
     sender.set_await_active(true);
@@ -323,7 +315,7 @@ mod tests {
   #[tokio::test]
   async fn share_replay_replays_for_late_subscribers() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let shared = MpscStream(rx).share_replay(2);
+    let shared = MpscStream(rx).share_replay(2, 16);
 
     let mut first = shared.clone();
 
@@ -351,7 +343,7 @@ mod tests {
   #[tokio::test]
   async fn share_replay_with_zero_buffer_replays_nothing() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let shared = MpscStream(rx).share_replay(0);
+    let shared = MpscStream(rx).share_replay(0, 16);
 
     let mut first = shared.clone();
 
@@ -373,9 +365,9 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn share_replay_with_capacity_replays_for_late_subscribers() {
+  async fn share_replay_with_explicit_capacity_replays_for_late_subscribers() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let shared = MpscStream(rx).share_replay_with_capacity(2, 1);
+    let shared = MpscStream(rx).share_replay(2, 1);
 
     let mut first = shared.clone();
 
@@ -398,7 +390,7 @@ mod tests {
 
   #[tokio::test]
   async fn weak_can_upgrade_to_share_replay_stream() {
-    let shared = futures::stream::iter([1_u32, 2, 3]).share_replay(2);
+    let shared = futures::stream::iter([1_u32, 2, 3]).share_replay(2, 16);
     let weak = shared.downgrade();
 
     let upgraded = weak.upgrade().expect("share replay stream should be alive");
@@ -411,7 +403,7 @@ mod tests {
   #[test]
   fn weak_does_not_keep_share_replay_stream_alive() {
     let weak = {
-      let shared = futures::stream::empty::<u32>().share_replay(2);
+      let shared = futures::stream::empty::<u32>().share_replay(2, 16);
       shared.downgrade()
     };
 

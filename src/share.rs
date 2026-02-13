@@ -214,13 +214,8 @@ where
 {
   /// Share the upstream stream across multiple subscribers (clones), using a broadcast channel.
   ///
-  /// Equivalent to `share_with_capacity(16)`.
-  fn share(self) -> ShareStream<Self> {
-    self.share_with_capacity(16)
-  }
-
-  /// Like `share()`, but with a custom channel capacity.
-  fn share_with_capacity(self, capacity: usize) -> ShareStream<Self> {
+  /// The `capacity` controls channel buffering and lag/backpressure behavior.
+  fn share(self, capacity: usize) -> ShareStream<Self> {
     let (mut sender, receiver) = async_broadcast::broadcast(capacity);
 
     // Wait for at least one receiver to be actively polled before sending.
@@ -266,7 +261,7 @@ mod tests {
 
   #[tokio::test]
   async fn share_multicasts_to_clones() {
-    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share();
+    let shared = futures::stream::iter([1_u32, 2, 3, 4, 5]).share(16);
 
     let a = shared.clone();
     let b = shared.clone();
@@ -311,7 +306,7 @@ mod tests {
       end: n,
       produced: Arc::clone(&produced),
     }
-    .share();
+    .share(16);
 
     let a = shared.clone();
     let b = shared.clone();
@@ -340,7 +335,7 @@ mod tests {
   #[tokio::test]
   async fn share_does_not_replay_to_late_subscribers() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let shared = MpscStream(rx).share();
+    let shared = MpscStream(rx).share(16);
 
     let mut a = shared.clone();
 
@@ -384,7 +379,7 @@ mod tests {
       end: 10_000,
       produced: Arc::clone(&produced),
     }
-    .share();
+    .share(16);
 
     // Start the forwarder by polling once, then drop the only receiver.
     let mut one = shared;
@@ -406,7 +401,7 @@ mod tests {
 
   #[tokio::test]
   async fn weak_can_upgrade_to_shared_stream() {
-    let shared = futures::stream::iter([1_u32, 2, 3]).share();
+    let shared = futures::stream::iter([1_u32, 2, 3]).share(16);
     let weak = shared.downgrade();
 
     let upgraded = weak.upgrade().expect("shared stream should be alive");
@@ -419,7 +414,7 @@ mod tests {
   #[test]
   fn weak_does_not_keep_shared_stream_alive() {
     let weak = {
-      let shared = futures::stream::empty::<u32>().share();
+      let shared = futures::stream::empty::<u32>().share(16);
       shared.downgrade()
     };
 
@@ -457,7 +452,7 @@ mod tests {
       receiver: rx,
       poll_count: Arc::clone(&poll_count),
     }
-    .share();
+    .share(16);
 
     // Start consuming to spawn the task and get it to block on source.next().await
     let receiver = shared.clone();
