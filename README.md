@@ -19,6 +19,7 @@ AI-curated stream utilities for Rust.
 - [share](src/share.rs)
 - [share_replay](src/share_replay.rs)
 - [throttle](src/throttle.rs)
+- [with_latest_from](src/with_latest_from.rs)
 
 ## License
 
