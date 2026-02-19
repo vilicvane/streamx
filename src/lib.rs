@@ -5,6 +5,7 @@ mod latest;
 mod scheduler;
 mod share;
 mod share_replay;
+mod throttle;
 
 pub use combine_latest::*;
 pub use debounce::*;
@@ -13,3 +14,4 @@ pub use latest::*;
 pub use scheduler::*;
 pub use share::*;
 pub use share_replay::*;
+pub use throttle::*;
