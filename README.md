@@ -9,7 +9,8 @@ AI-curated stream utilities for Rust.
 
 ## Create
 
-- [combine_latest](src/combine_latest.rs)
+- [combine_latest/combine_latest_all](src/combine_latest.rs)
+- [merge_all](src/merge_all.rs)
 
 ## Pipe
 
