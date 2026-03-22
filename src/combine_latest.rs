@@ -333,6 +333,18 @@ where
 /// Combine the latest values from a collection of streams.
 ///
 /// This yields a vector with one item per input stream, matching the iterator order.
+pub fn combine_latest_all<TInto, TStream>(streams: TInto) -> CombineLatestIterStream<TStream>
+where
+  TInto: IntoIterator<Item = TStream>,
+  TStream: Stream,
+  TStream::Item: Clone,
+{
+  CombineLatestIterStream::new(streams)
+}
+
+/// Combine the latest values from a collection of streams.
+///
+/// This yields a vector with one item per input stream, matching the iterator order.
 pub trait StreamCombineLatestExt<TStream>
 where
   TStream: Stream,
@@ -352,11 +364,11 @@ where
   ///   futures::stream::iter([10_u32, 11]),
   /// ];
   ///
-  /// let mut combined = streams.combine_latest();
+  /// let mut combined = streams.combine_latest_all();
   /// let value = block_on(async { combined.next().await });
   /// assert_eq!(value, Some(vec![2, 11]));
   /// ```
-  fn combine_latest(self) -> CombineLatestIterStream<TStream>;
+  fn combine_latest_all(self) -> CombineLatestIterStream<TStream>;
 }
 
 impl<TInto, TStream> StreamCombineLatestExt<TStream> for TInto
@@ -365,8 +377,8 @@ where
   TStream: Stream,
   TStream::Item: Clone,
 {
-  fn combine_latest(self) -> CombineLatestIterStream<TStream> {
-    CombineLatestIterStream::new(self)
+  fn combine_latest_all(self) -> CombineLatestIterStream<TStream> {
+    combine_latest_all(self)
   }
 }
 
@@ -378,7 +390,7 @@ mod tests {
   use futures::StreamExt;
   use lits::duration;
 
-  use super::StreamCombineLatestExt;
+  use super::{StreamCombineLatestExt, combine_latest_all};
 
   struct MpscStream<T>(tokio::sync::mpsc::UnboundedReceiver<T>);
 
@@ -485,7 +497,20 @@ mod tests {
       futures::stream::iter(vec![10_u32, 11]),
     ];
 
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
+
+    assert_eq!(combined.next().await, Some(vec![3, 11]));
+    assert_eq!(combined.next().await, None);
+  }
+
+  #[tokio::test]
+  async fn combine_latest_all_fn_yields_latest_values() {
+    let streams = vec![
+      futures::stream::iter(vec![1_u32, 2, 3]),
+      futures::stream::iter(vec![10_u32, 11]),
+    ];
+
+    let mut combined = combine_latest_all(streams);
 
     assert_eq!(combined.next().await, Some(vec![3, 11]));
     assert_eq!(combined.next().await, None);
@@ -498,7 +523,7 @@ mod tests {
       futures::stream::iter(Vec::<u32>::new()),
     ];
 
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     assert_eq!(combined.next().await, None);
   }
@@ -507,7 +532,7 @@ mod tests {
   async fn combine_latest_iter_empty_collection() {
     let streams: Vec<futures::stream::Iter<std::vec::IntoIter<u32>>> = vec![];
 
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     assert_eq!(combined.next().await, None);
   }
@@ -516,7 +541,7 @@ mod tests {
   async fn combine_latest_iter_single_stream() {
     let streams = vec![futures::stream::iter(vec![1_u32, 2, 3])];
 
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     assert_eq!(combined.next().await, Some(vec![3]));
     assert_eq!(combined.next().await, None);
@@ -528,7 +553,7 @@ mod tests {
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
     let streams = vec![MpscStream(rx1), MpscStream(rx2)];
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     tx1.send(1).unwrap();
     tx2.send(10).unwrap();
@@ -547,7 +572,7 @@ mod tests {
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
     let streams = vec![MpscStream(rx1), MpscStream(rx2)];
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     tx1.send(1).unwrap();
 
@@ -565,7 +590,7 @@ mod tests {
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
     let streams = vec![MpscStream(rx1), MpscStream(rx2)];
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     tx1.send(1).unwrap();
     tx2.send(10).unwrap();
@@ -583,7 +608,7 @@ mod tests {
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
     let streams = vec![MpscStream(rx1), MpscStream(rx2)];
-    let mut combined = streams.combine_latest();
+    let mut combined = streams.combine_latest_all();
 
     tx1.send(1).unwrap();
     tx2.send(10).unwrap();
