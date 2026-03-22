@@ -1,4 +1,5 @@
 mod combine_latest;
+mod combine_latest_all;
 mod debounce;
 mod distinct_until_changed;
 mod latest;
@@ -10,6 +11,7 @@ mod throttle;
 mod with_latest_from;
 
 pub use combine_latest::*;
+pub use combine_latest_all::*;
 pub use debounce::*;
 pub use distinct_until_changed::*;
 pub use latest::*;
