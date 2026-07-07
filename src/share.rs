@@ -191,17 +191,31 @@ where
 {
   /// Attempt to upgrade to a strong `ShareStream`.
   ///
-  /// Returns `None` if all strong handles have been dropped and the shared
-  /// stream has been deallocated.
+  /// Returns `None` if the shared stream has been deallocated, or if it can no
+  /// longer produce items: once the last strong handle drops (`stop()`) or the
+  /// source ends, the sender is closed and the consumed source cannot be
+  /// restarted, so upgrading would only yield a dead subscriber.
   pub fn upgrade(&self) -> Option<ShareStream<T>> {
-    self.inner.upgrade().map(|inner| {
-      inner.subscription_count.fetch_add(1, Ordering::Relaxed);
+    let inner = self.inner.upgrade()?;
 
-      let inner_clone = Arc::clone(&inner);
-      ShareStream {
-        inner: inner_clone,
-        receiver: None,
-      }
+    if inner.sender.is_closed() {
+      return None;
+    }
+
+    // The inner allocation may briefly outlive the last strong handle (e.g. the
+    // aborted forwarding task still holds it), so a successful `Weak::upgrade`
+    // alone is not enough: refuse to resurrect an inner whose subscription
+    // count already reached zero.
+    inner
+      .subscription_count
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |subscription_count| {
+        (subscription_count > 0).then_some(subscription_count + 1)
+      })
+      .ok()?;
+
+    Some(ShareStream {
+      inner,
+      receiver: None,
     })
   }
 }
@@ -465,6 +479,39 @@ mod tests {
       shared.downgrade()
     };
 
+    assert!(weak.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn weak_upgrade_refuses_stopped_stream() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let shared = MpscStream(rx).share(16);
+    let weak = shared.downgrade();
+
+    // Drive the stream so the forwarding task starts and takes the source.
+    let mut subscriber = shared.clone();
+    tx.send(1).unwrap();
+    assert_eq!(subscriber.next().await, Some(1));
+
+    // Dropping the last strong handle stops the stream for good. The aborted
+    // forwarding task may still keep the inner allocation alive for a moment,
+    // but upgrading must not resurrect the stopped stream.
+    drop(subscriber);
+    drop(shared);
+
+    assert!(weak.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn weak_upgrade_refuses_ended_stream() {
+    let shared = futures::stream::iter([1_u32, 2, 3]).share(16);
+    let weak = shared.downgrade();
+
+    let values = shared.clone().collect::<Vec<_>>().await;
+    assert_eq!(values, vec![1, 2, 3]);
+
+    // A strong handle still exists, but the source has ended and the sender is
+    // closed — an upgraded subscriber could never receive anything.
     assert!(weak.upgrade().is_none());
   }
 

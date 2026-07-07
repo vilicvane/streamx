@@ -77,6 +77,7 @@ mod tests {
   use std::pin::Pin;
   use std::task::{Context, Poll};
 
+  use futures::Stream;
   use futures::StreamExt;
 
   use super::StreamLatestExt;
@@ -181,5 +182,153 @@ mod tests {
 
     drop(tx);
     assert_eq!(latest.next().await, None);
+  }
+
+  #[tokio::test]
+  async fn latest_drops_upstream_when_dropped() {
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let counter = TestArc::new(());
+    let weak_counter = TestArc::downgrade(&counter);
+
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let tracked = DropTracker {
+      inner: MpscStream(rx),
+      counter: counter.clone(),
+    };
+    drop(counter);
+
+    let latest = tracked.latest();
+    drop(latest);
+
+    assert!(
+      weak_counter.upgrade().is_none(),
+      "source stream should have been dropped when LatestStream is dropped"
+    );
+  }
+
+  #[tokio::test]
+  async fn with_latest_from_latest_drops_both_upstreams_when_dropped() {
+    use crate::StreamWithLatestFromExt;
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let source_counter = TestArc::new(());
+    let weak_source = TestArc::downgrade(&source_counter);
+    let from_counter = TestArc::new(());
+    let weak_from = TestArc::downgrade(&from_counter);
+
+    // Simulate the real-world chain: with_latest_from(...).latest()
+    let (_source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let source_tracked = DropTracker {
+      inner: MpscStream(source_rx),
+      counter: source_counter.clone(),
+    };
+    drop(source_counter);
+
+    let (_from_tx, from_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let from_tracked = DropTracker {
+      inner: MpscStream(from_rx),
+      counter: from_counter.clone(),
+    };
+    drop(from_counter);
+
+    let stream = source_tracked.with_latest_from(from_tracked).latest();
+
+    // Drop the combined stream — both upstreams should be released.
+    drop(stream);
+
+    assert!(
+      weak_source.upgrade().is_none(),
+      "source stream should have been dropped"
+    );
+    assert!(
+      weak_from.upgrade().is_none(),
+      "from stream should have been dropped"
+    );
+  }
+
+  #[tokio::test]
+  async fn with_latest_from_latest_drops_both_upstreams_after_polling() {
+    use crate::StreamWithLatestFromExt;
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let source_counter = TestArc::new(());
+    let weak_source = TestArc::downgrade(&source_counter);
+    let from_counter = TestArc::new(());
+    let weak_from = TestArc::downgrade(&from_counter);
+
+    let (source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let source_tracked = DropTracker {
+      inner: MpscStream(source_rx),
+      counter: source_counter.clone(),
+    };
+    drop(source_counter);
+
+    let (from_tx, from_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let from_tracked = DropTracker {
+      inner: MpscStream(from_rx),
+      counter: from_counter.clone(),
+    };
+    drop(from_counter);
+
+    let mut stream = source_tracked.with_latest_from(from_tracked).latest();
+
+    // Drive the stream so both upstreams are polled.
+    from_tx.send(10).unwrap();
+    source_tx.send(1).unwrap();
+    assert_eq!(stream.next().await, Some((1, 10)));
+
+    // Drop everything — including the stream and the tx handles.
+    drop(source_tx);
+    drop(from_tx);
+    drop(stream);
+
+    assert!(
+      weak_source.upgrade().is_none(),
+      "source stream should have been dropped after polling"
+    );
+    assert!(
+      weak_from.upgrade().is_none(),
+      "from stream should have been dropped after polling"
+    );
   }
 }

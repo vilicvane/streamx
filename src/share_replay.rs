@@ -163,16 +163,35 @@ where
   T: Stream + Send + 'static,
   T::Item: Clone + Send + 'static,
 {
+  /// Attempt to upgrade to a strong `ShareReplayStream`.
+  ///
+  /// Returns `None` if the shared stream has been deallocated, or if it can no
+  /// longer produce items: once the last strong handle drops (`stop()`) or the
+  /// source ends, the sender is closed and the consumed source cannot be
+  /// restarted, so upgrading would only replay stale items and end.
   pub fn upgrade(&self) -> Option<ShareReplayStream<T>> {
-    self.inner.upgrade().map(|inner| {
-      inner.subscription_count.fetch_add(1, Ordering::Relaxed);
+    let inner = self.inner.upgrade()?;
 
-      ShareReplayStream {
-        inner: Arc::clone(&inner),
-        receiver: None,
-        replay_queue: VecDeque::new(),
-        replay_max_sequence: None,
-      }
+    if inner.sender.is_closed() {
+      return None;
+    }
+
+    // The inner allocation may briefly outlive the last strong handle (e.g. the
+    // aborted forwarding task still holds it), so a successful `Weak::upgrade`
+    // alone is not enough: refuse to resurrect an inner whose subscription
+    // count already reached zero.
+    inner
+      .subscription_count
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |subscription_count| {
+        (subscription_count > 0).then_some(subscription_count + 1)
+      })
+      .ok()?;
+
+    Some(ShareReplayStream {
+      inner,
+      receiver: None,
+      replay_queue: VecDeque::new(),
+      replay_max_sequence: None,
     })
   }
 }
@@ -326,6 +345,7 @@ where
 #[cfg(test)]
 mod tests {
   use super::StreamShareReplayExt;
+  use futures::Stream;
   use futures::StreamExt;
   use std::pin::Pin;
   use std::task::{Context, Poll};
@@ -467,5 +487,176 @@ mod tests {
     };
 
     assert!(weak.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn weak_upgrade_refuses_stopped_stream() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let shared = MpscStream(rx).share_replay_latest();
+    let weak = shared.downgrade();
+
+    // Drive the stream so the forwarding task starts and takes the source.
+    let mut subscriber = shared.clone();
+    tx.send(1).unwrap();
+    assert_eq!(subscriber.next().await, Some(1));
+
+    // Dropping the last strong handle stops the stream for good. The aborted
+    // forwarding task may still keep the inner allocation alive for a moment,
+    // but upgrading must not resurrect the stopped stream: it would only
+    // replay the stale buffer and end.
+    drop(subscriber);
+    drop(shared);
+
+    assert!(weak.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn weak_upgrade_refuses_ended_stream() {
+    let shared = futures::stream::iter([1_u32, 2, 3]).share_replay(2, 16);
+    let weak = shared.downgrade();
+
+    let values = shared.clone().collect::<Vec<_>>().await;
+    assert_eq!(values, vec![1, 2, 3]);
+
+    // A strong handle still exists, but the source has ended and the sender is
+    // closed — an upgraded subscriber would only replay stale items and end.
+    assert!(weak.upgrade().is_none());
+  }
+
+  #[tokio::test]
+  async fn source_stream_is_dropped_when_all_subscribers_drop() {
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let counter = TestArc::new(());
+    let weak_counter = TestArc::downgrade(&counter);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let tracked = DropTracker {
+      inner: MpscStream(rx),
+      counter: counter.clone(),
+    };
+    drop(counter);
+
+    let shared = tracked.share_replay_latest();
+
+    // Drive the stream so the task is spawned and takes ownership of the source.
+    let mut sub1 = shared.clone();
+    tx.send(1).unwrap();
+    assert_eq!(sub1.next().await, Some(1));
+
+    // Drop everything — including the tx that keeps the source channel open.
+    drop(tx);
+    drop(sub1);
+    drop(shared);
+
+    // Let the runtime process the task abort and drop the source.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+      weak_counter.upgrade().is_none(),
+      "source stream should have been dropped after all subscribers dropped"
+    );
+  }
+
+  #[tokio::test]
+  async fn source_stream_is_dropped_without_consuming() {
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let counter = TestArc::new(());
+    let weak_counter = TestArc::downgrade(&counter);
+
+    // A source that never produces — simulates a long-lived upstream.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let tracked = DropTracker {
+      inner: MpscStream(rx),
+      counter: counter.clone(),
+    };
+    drop(counter);
+
+    let shared = tracked.share_replay_latest();
+
+    // Clone but never poll — task is never started, source stays in the Mutex.
+    let _sub = shared.clone();
+    drop(_sub);
+    drop(shared);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+      weak_counter.upgrade().is_none(),
+      "source stream should have been dropped even without consuming"
+    );
+  }
+
+  #[tokio::test]
+  async fn source_stream_is_dropped_when_task_blocked_on_source() {
+    use std::sync::Arc as TestArc;
+
+    struct DropTracker<T> {
+      inner: T,
+      counter: TestArc<()>,
+    }
+
+    impl<T: Stream + Unpin> Stream for DropTracker<T> {
+      type Item = T::Item;
+
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+      }
+    }
+
+    let counter = TestArc::new(());
+    let weak_counter = TestArc::downgrade(&counter);
+
+    // A source that never produces — the task will block on source.next().await.
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let tracked = DropTracker {
+      inner: MpscStream(rx),
+      counter: counter.clone(),
+    };
+    drop(counter);
+
+    let shared = tracked.share_replay_latest();
+
+    // Poll once to spawn the task; it will block waiting for the source.
+    let mut sub = shared.clone();
+    // Use a timeout to avoid hanging — the poll will register interest and return Pending.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(10), sub.next()).await;
+
+    drop(sub);
+    drop(shared);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+      weak_counter.upgrade().is_none(),
+      "source stream should have been dropped even when task is blocked on source"
+    );
   }
 }
