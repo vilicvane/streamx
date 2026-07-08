@@ -190,7 +190,7 @@ mod tests {
 
     struct DropTracker<T> {
       inner: T,
-      counter: TestArc<()>,
+      _counter: TestArc<()>,
     }
 
     impl<T: Stream + Unpin> Stream for DropTracker<T> {
@@ -207,7 +207,7 @@ mod tests {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let tracked = DropTracker {
       inner: MpscStream(rx),
-      counter: counter.clone(),
+      _counter: counter.clone(),
     };
     drop(counter);
 
@@ -227,7 +227,7 @@ mod tests {
 
     struct DropTracker<T> {
       inner: T,
-      counter: TestArc<()>,
+      _counter: TestArc<()>,
     }
 
     impl<T: Stream + Unpin> Stream for DropTracker<T> {
@@ -247,14 +247,14 @@ mod tests {
     let (_source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let source_tracked = DropTracker {
       inner: MpscStream(source_rx),
-      counter: source_counter.clone(),
+      _counter: source_counter.clone(),
     };
     drop(source_counter);
 
     let (_from_tx, from_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let from_tracked = DropTracker {
       inner: MpscStream(from_rx),
-      counter: from_counter.clone(),
+      _counter: from_counter.clone(),
     };
     drop(from_counter);
 
@@ -280,7 +280,7 @@ mod tests {
 
     struct DropTracker<T> {
       inner: T,
-      counter: TestArc<()>,
+      _counter: TestArc<()>,
     }
 
     impl<T: Stream + Unpin> Stream for DropTracker<T> {
@@ -299,14 +299,14 @@ mod tests {
     let (source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let source_tracked = DropTracker {
       inner: MpscStream(source_rx),
-      counter: source_counter.clone(),
+      _counter: source_counter.clone(),
     };
     drop(source_counter);
 
     let (from_tx, from_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let from_tracked = DropTracker {
       inner: MpscStream(from_rx),
-      counter: from_counter.clone(),
+      _counter: from_counter.clone(),
     };
     drop(from_counter);
 
