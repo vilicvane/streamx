@@ -1,21 +1,18 @@
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+  marker::PhantomData,
+  pin::Pin,
+  task::{Context, Poll},
+};
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
-/// Combine the latest values from multiple streams.
+use crate::hot::{HotStream, WORK_BUDGET};
+
+/// Combine heterogeneous streams into a hot, conflating state stream.
 ///
-/// This is the `streamx` equivalent of Rx's `combineLatest`.
-///
-/// Semantics:
-/// - No item is yielded until each input stream has produced at least one item.
-/// - If any stream ends before producing its first item, the combined stream ends immediately.
-/// - After the first full set is available, the combined stream yields a new tuple whenever any
-///   input stream produces a new item.
-/// - The combined stream ends once all input streams have ended.
-///
-/// Notes:
-/// - Requires each `Item: Clone`, since previously seen values may be emitted multiple times.
+/// Every input is actively polled from construction. The output retains only
+/// the newest unconsumed tuple and starts producing after all inputs have a
+/// value. All inputs and items must be `Send + 'static`.
 #[macro_export]
 macro_rules! combine_latest {
   ($a:expr, $b:expr $(,)?) => {
@@ -44,109 +41,98 @@ macro_rules! combine_latest {
 macro_rules! impl_combine_latest {
   (
     $name:ident<$($S:ident),+> {
-      $(
-        stream: $stream:ident : $SType:ident,
-        latest: $latest:ident,
-        done: $done:ident
-      ),+ $(,)?
+      $(stream: $stream:ident : $SType:ident, latest: $latest:ident, done: $done:ident),+ $(,)?
     }
     => ($($out:ident),+)
   ) => {
-    /// A stream created by [`combine_latest!`].
+    /// A hot stream created by [`combine_latest!`].
     pub struct $name<$($S),+>
     where
-      $(
-        $S: Stream,
-        <$S as Stream>::Item: Clone,
-      )+
+      $($S: Stream,)+
     {
-      $(
-        $stream: Pin<Box<$SType>>,
-        $latest: Option<<$SType as Stream>::Item>,
-        $done: bool,
-      )+
+      inner: HotStream<($(<$S as Stream>::Item,)+)>,
+      sources: PhantomData<fn() -> ($($S,)+)>,
     }
 
     impl<$($S),+> $name<$($S),+>
     where
       $(
-        $S: Stream,
-        <$S as Stream>::Item: Clone,
+        $S: Stream + Send + 'static,
+        <$S as Stream>::Item: Clone + Send + 'static,
       )+
     {
       #[allow(clippy::too_many_arguments)]
       pub fn new($($stream: $S),+) -> Self {
-        Self {
+        let inner = HotStream::spawn(1, |output| async move {
           $(
-            $stream: Box::pin($stream),
-            $latest: None,
-            $done: false,
+            let mut $stream = Box::pin($stream);
+            let mut $latest = None;
+            let mut $done = false;
           )+
+          let mut work = 0;
+
+          loop {
+            if true $(&& $done)+ {
+              break;
+            }
+
+            let mut updated = false;
+            let mut impossible = false;
+
+            tokio::select! {
+              $(
+                item = $stream.next(), if !$done => {
+                  match item {
+                    Some(item) => {
+                      $latest = Some(item);
+                      updated = true;
+                    }
+                    None => {
+                      $done = true;
+                      impossible = $latest.is_none();
+                    }
+                  }
+                }
+              )+
+              else => break,
+            }
+
+            if impossible {
+              break;
+            }
+
+            if updated && true $(&& $latest.is_some())+ {
+              output.send(($(
+                $out
+                  .as_ref()
+                  .expect("all latest values were checked")
+                  .clone(),
+              )+));
+            }
+
+            work += 1;
+            if work == WORK_BUDGET {
+              work = 0;
+              tokio::task::yield_now().await;
+            }
+          }
+        });
+
+        Self {
+          inner,
+          sources: PhantomData,
         }
       }
     }
 
     impl<$($S),+> Stream for $name<$($S),+>
     where
-      $(
-        $S: Stream,
-        <$S as Stream>::Item: Clone,
-      )+
+      $($S: Stream,)+
     {
-      type Item = ($(<$S as Stream>::Item),+);
+      type Item = ($(<$S as Stream>::Item,)+);
 
-      fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Safety: we never move any `Pin<Box<..>>` fields. We only poll them and update the
-        // non-pinned `Option<Item>` state.
-        let this = unsafe { self.get_unchecked_mut() };
-
-        let mut updated = false;
-
-        loop {
-          let mut made_progress = false;
-
-          $(
-            if !this.$done {
-              match this.$stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(item)) => {
-                  this.$latest = Some(item);
-                  updated = true;
-                  made_progress = true;
-                }
-                Poll::Ready(None) => {
-                  this.$done = true;
-                  if this.$latest.is_none() {
-                    // This stream ended before its first item, so the combined stream can never
-                    // produce a full tuple.
-                    return Poll::Ready(None);
-                  }
-                }
-                Poll::Pending => {}
-              }
-            }
-          )+
-
-          if !made_progress {
-            break;
-          }
-        }
-
-        if updated && true $(&& this.$latest.is_some())+ {
-          return Poll::Ready(Some((
-            $(
-              this.$out
-                .as_ref()
-                .expect("latest must exist when all latest are present")
-                .clone(),
-            )+
-          )));
-        }
-
-        if true $(&& this.$done)+ {
-          return Poll::Ready(None);
-        }
-
-        Poll::Pending
+      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
       }
     }
   };
@@ -231,15 +217,17 @@ impl_combine_latest!(
 
 #[cfg(test)]
 mod tests {
-  use std::pin::Pin;
-  use std::task::{Context, Poll};
+  use std::{
+    pin::Pin,
+    task::{Context, Poll},
+  };
 
-  use futures::StreamExt;
+  use futures::{Stream, StreamExt};
   use lits::duration;
 
   struct MpscStream<T>(tokio::sync::mpsc::UnboundedReceiver<T>);
 
-  impl<T> futures::Stream for MpscStream<T> {
+  impl<T> Stream for MpscStream<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -248,90 +236,72 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn combine_latest_waits_for_all_first_items() {
-    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
-
+  async fn waits_for_every_initial_value() {
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
     let mut combined = combine_latest!(MpscStream(rx1), MpscStream(rx2));
 
     tx1.send(1).unwrap();
-
-    // Should not yield yet because stream2 has no first value.
-    let timed = tokio::time::timeout(duration!("25ms"), combined.next()).await;
-    assert!(timed.is_err());
+    assert!(
+      tokio::time::timeout(duration!("20ms"), combined.next())
+        .await
+        .is_err()
+    );
 
     tx2.send(10).unwrap();
     assert_eq!(combined.next().await, Some((1, 10)));
   }
 
   #[tokio::test]
-  async fn combine_latest_emits_on_updates() {
-    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
-
+  async fn conflates_updates_while_downstream_is_idle() {
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
     let mut combined = combine_latest!(MpscStream(rx1), MpscStream(rx2));
 
     tx1.send(1).unwrap();
     tx2.send(10).unwrap();
+    tokio::time::sleep(duration!("10ms")).await;
     assert_eq!(combined.next().await, Some((1, 10)));
 
     tx1.send(2).unwrap();
-    assert_eq!(combined.next().await, Some((2, 10)));
-
     tx2.send(11).unwrap();
-    assert_eq!(combined.next().await, Some((2, 11)));
+    tx1.send(3).unwrap();
+    tokio::time::sleep(duration!("10ms")).await;
+    assert_eq!(combined.next().await, Some((3, 11)));
   }
 
   #[tokio::test]
-  async fn combine_latest_ends_immediately_if_a_stream_ends_before_first_item() {
-    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (_tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
-
-    // Close stream2 without any items.
-    drop(_tx2);
-
-    let mut combined = combine_latest!(MpscStream(rx1), MpscStream(rx2));
-
-    tx1.send(1).unwrap();
-
-    // Once polled, it should notice stream2 ended before first item.
-    assert_eq!(combined.next().await, None);
-  }
-
-  #[tokio::test]
-  async fn combine_latest_ends_when_all_streams_end() {
-    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
-
+  async fn completion_retains_existing_latest_values() {
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
     let mut combined = combine_latest!(MpscStream(rx1), MpscStream(rx2));
 
     tx1.send(1).unwrap();
     tx2.send(10).unwrap();
     assert_eq!(combined.next().await, Some((1, 10)));
-
     drop(tx1);
-    drop(tx2);
 
+    tx2.send(11).unwrap();
+    assert_eq!(combined.next().await, Some((1, 11)));
+    drop(tx2);
     assert_eq!(combined.next().await, None);
   }
 
   #[tokio::test]
-  async fn combine_latest_supports_three_streams() {
-    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let (tx3, rx3) = tokio::sync::mpsc::unbounded_channel::<u32>();
+  async fn ends_if_an_input_completes_without_a_value() {
+    let combined = combine_latest!(futures::stream::iter([1]), futures::stream::empty::<u32>(),);
 
-    let mut combined = combine_latest!(MpscStream(rx1), MpscStream(rx2), MpscStream(rx3));
+    assert_eq!(combined.collect::<Vec<_>>().await, vec![]);
+  }
 
-    tx1.send(1).unwrap();
-    tx2.send(10).unwrap();
-    let timed = tokio::time::timeout(duration!("25ms"), combined.next()).await;
-    assert!(timed.is_err());
+  #[tokio::test]
+  async fn supports_three_inputs() {
+    let combined = combine_latest!(
+      futures::stream::iter([1, 2]),
+      futures::stream::iter([10, 20]),
+      futures::stream::iter([100, 200]),
+    );
 
-    tx3.send(100).unwrap();
-    assert_eq!(combined.next().await, Some((1, 10, 100)));
-
-    tx2.send(11).unwrap();
-    assert_eq!(combined.next().await, Some((1, 11, 100)));
+    assert_eq!(combined.collect::<Vec<_>>().await, vec![(2, 20, 200)]);
   }
 }

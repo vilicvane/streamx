@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain StreamX"
+  short_description: "Maintain StreamX semantics, tests, and guidance"
+  default_prompt: "Use $maintain-streamx to make this StreamX maintenance change while preserving its documented semantics."

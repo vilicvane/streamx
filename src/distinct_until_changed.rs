@@ -3,6 +3,8 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 
+use crate::hot::WORK_BUDGET;
+
 /// A stream that only emits values when they differ from the previous value.
 ///
 /// This stream filters out consecutive duplicate values, only yielding items
@@ -28,7 +30,7 @@ where
 
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     let this = unsafe { self.get_unchecked_mut() };
-    loop {
+    for _ in 0..WORK_BUDGET {
       match this.source.as_mut().poll_next(cx) {
         Poll::Ready(Some(item)) => {
           match &this.previous {
@@ -51,6 +53,9 @@ where
         }
       }
     }
+
+    cx.waker().wake_by_ref();
+    Poll::Pending
   }
 }
 
@@ -80,7 +85,7 @@ where
 
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     let this = unsafe { self.get_unchecked_mut() };
-    loop {
+    for _ in 0..WORK_BUDGET {
       match this.source.as_mut().poll_next(cx) {
         Poll::Ready(Some(item)) => {
           match &this.previous {
@@ -103,6 +108,9 @@ where
         }
       }
     }
+
+    cx.waker().wake_by_ref();
+    Poll::Pending
   }
 }
 

@@ -1,7 +1,10 @@
+#![doc = include_str!("../README.md")]
+
 mod combine_latest;
 mod combine_latest_all;
 mod debounce;
 mod distinct_until_changed;
+mod hot;
 mod latest;
 mod merge_all;
 mod scheduler;
