@@ -83,6 +83,7 @@ completed. Only `Poll::Ready(None)` is source completion.
 | Operator | Upstream progress | Retained output | Back pressure |
 | --- | --- | --- | --- |
 | `merge_all` | Downstream-driven | None beyond input streams | Lossless |
+| `merge_ordered` | Downstream-driven | One head per unfinished input | Lossless; any missing head blocks selection |
 | `distinct_until_changed(_by)` | Downstream-driven | Previous comparison item | Preserved for distinct transitions |
 | `latest` | Background task | One latest item | None |
 | `combine_latest!`, `combine_latest_all` | Background task | One latest combined snapshot | None |
@@ -230,6 +231,45 @@ where
 - The `futures::stream::SelectAll` return type and `Unpin` input requirement
   are part of the public API.
 
+### `merge_ordered`
+
+- `Ordered` defines an item's canonical `Key: Ord` through `order_key()`.
+- Every input must already be ordered by a nondecreasing key. The operator
+  merges those sequences; it does not sort or validate an input sequence.
+- Merge is pull-based and lossless. Construction does not poll any input.
+- At most one head item and its extracted key are retained from each unfinished
+  input. A key is extracted exactly once for each item.
+- No output can be selected until every unfinished input has a head item or has
+  completed. A pending input without a head therefore keeps the result pending.
+- The smallest head is emitted. Equal-key heads are resolved by input iteration
+  order, and order within each input is preserved.
+- After emitting a head, only that input needs replenishment before the next
+  selection. Downstream demand controls all replenishment.
+- A completed input no longer participates in selection. The result completes
+  after every input completes and all retained heads are emitted. An empty
+  collection completes immediately.
+- Dropping the result releases every input and retained head.
+- Inputs, items, and keys require no `Unpin`, `Send`, `'static`, or `Clone`
+  bound.
+
+Public shape:
+
+```rust
+trait Ordered {
+  type Key: Ord;
+
+  fn order_key(&self) -> Self::Key;
+}
+
+fn merge_ordered<TStreams, TStream>(
+  streams: TStreams,
+) -> MergeOrderedStream<TStream>
+where
+  TStreams: IntoIterator<Item = TStream>,
+  TStream: Stream,
+  TStream::Item: Ordered;
+```
+
 ### `distinct_until_changed` and `distinct_until_changed_by`
 
 - Both operators remain pull-based.
@@ -281,6 +321,20 @@ All non-replay sharing rules also apply, with these additions:
 - `share_replay_latest()` is exactly `share_replay_overflow(1, 1)`.
 
 ## Implementation invariants
+
+### Ordered merge
+
+- Input streams are pinned internally; public callers do not need to provide
+  `Unpin` streams.
+- Missing heads are polled cooperatively with the shared work budget. Partially
+  completed scans wake themselves to continue. A full scan that still has a
+  missing head starts another scan if any input woke during that scan;
+  otherwise the registered input wakers control the next attempt.
+- Input wakers forward through shared state that is updated with the current
+  downstream waker on every poll; a budgeted scan must not retain an obsolete
+  downstream waker across poll calls.
+- Head selection compares cached keys and must not call `order_key()` again.
+- The lower input index wins an equal-key comparison.
 
 ### Hot single-consumer channel
 
@@ -346,6 +400,11 @@ dimensions:
 - replay/live handoff without duplication or loss;
 - restart of `with_latest_from(...).latest()` using replayed secondary state
   without requiring a new secondary update.
+- ordered merge global ordering, equal-key input order, and per-input order;
+- ordered merge pending-head blocking, one-head retention, pull-based startup,
+  empty inputs, completion, non-`Unpin` inputs, and cooperative large-input
+  polling, including a wake from an earlier chunk and downstream waker
+  replacement across chunks of a budgeted scan.
 
 ## Review checklist
 

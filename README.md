@@ -30,6 +30,7 @@ runtime. Their upstream streams and items require `Send + 'static`.
 | Need | Operator | Delivery behavior |
 | --- | --- | --- |
 | Merge homogeneous event streams | `merge_all` | Pull-based and lossless |
+| Merge streams already sorted by a canonical item key | `merge_ordered` | Pull-based and lossless; one head per unfinished input |
 | Suppress consecutive duplicates | `distinct_until_changed` | Pull-based; distinct transitions remain lossless |
 | Observe only the newest state | `latest` | Hot; one unconsumed value is retained |
 | Combine the current state of several streams | `combine_latest!`, `combine_latest_all` | Hot; one unconsumed combined snapshot is retained |
@@ -82,6 +83,45 @@ async fn main() {
 `combine_latest` is a state-combination operator. If several inputs update
 before the output is observed, only the newest combined snapshot remains. It
 does not preserve one output for every input event.
+
+### Merge canonical event order
+
+```rust
+use futures::{StreamExt, stream};
+use streamx::{Ordered, merge_ordered};
+
+#[derive(Debug, PartialEq, Eq)]
+struct Event {
+  time: u64,
+}
+
+impl Ordered for Event {
+  type Key = u64;
+
+  fn order_key(&self) -> Self::Key {
+    self.time
+  }
+}
+
+# async fn example() {
+let streams = [
+  stream::iter([Event { time: 1 }, Event { time: 3 }]),
+  stream::iter([Event { time: 2 }, Event { time: 4 }]),
+];
+
+let times = merge_ordered(streams)
+  .map(|event| event.time)
+  .collect::<Vec<_>>()
+  .await;
+
+assert_eq!(times, vec![1, 2, 3, 4]);
+# }
+```
+
+Every input must already be ordered by a nondecreasing `Ordered::Key`.
+`merge_ordered` retains one head from each unfinished input and cannot emit
+until every such input has produced a head or completed. Equal keys are emitted
+in input order. The operator does not poll upstream before downstream demand.
 
 ### Bound time-based output
 
@@ -171,6 +211,7 @@ Creation and collection operators:
 - [`combine_latest!`](https://docs.rs/streamx/latest/streamx/macro.combine_latest.html)
 - [`combine_latest_all`](https://docs.rs/streamx/latest/streamx/fn.combine_latest_all.html)
 - [`merge_all`](https://docs.rs/streamx/latest/streamx/fn.merge_all.html)
+- [`merge_ordered`](https://docs.rs/streamx/latest/streamx/fn.merge_ordered.html)
 
 Stream extension operators:
 
