@@ -271,7 +271,7 @@ where
   TStream::Item: Ordered;
 ```
 
-### `try_merge_ordered`
+#### `try_merge_ordered`
 
 - Each input is a `TryStream`. Its `Ok` subsequence must already be ordered by
   a nondecreasing `Ordered::Key`; errors do not participate in that ordering.
