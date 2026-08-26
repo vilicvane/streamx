@@ -84,6 +84,7 @@ completed. Only `Poll::Ready(None)` is source completion.
 | --- | --- | --- | --- |
 | `merge_all` | Downstream-driven | None beyond input streams | Lossless |
 | `merge_ordered` | Downstream-driven | One head per unfinished input | Lossless; any missing head blocks selection |
+| `try_merge_ordered` | Downstream-driven | One `Ok` head per unfinished input | Lossless; missing `Ok` heads block `Ok` selection, not observed errors |
 | `distinct_until_changed(_by)` | Downstream-driven | Previous comparison item | Preserved for distinct transitions |
 | `latest` | Background task | One latest item | None |
 | `combine_latest!`, `combine_latest_all` | Background task | One latest combined snapshot | None |
@@ -270,6 +271,42 @@ where
   TStream::Item: Ordered;
 ```
 
+### `try_merge_ordered`
+
+- Each input is a `TryStream`. Its `Ok` subsequence must already be ordered by
+  a nondecreasing `Ordered::Key`; errors do not participate in that ordering.
+- Removing every error from the result yields exactly the sequence produced by
+  applying `merge_ordered` to the `Ok` subsequence of every input. Every
+  observed error is also emitted exactly once.
+- All `merge_ordered` selection rules apply to successful values: one retained
+  head and extracted key per unfinished input, smallest-key selection,
+  input-order ties, and per-input order preservation.
+- An error observed while replenishing a missing input is emitted immediately
+  without waiting for every unfinished input to have an `Ok` head. Errors are
+  not globally ordered relative to successful values or errors from other
+  inputs.
+- Emitting an error neither discards retained successful heads nor completes
+  the operator. Its input remains unfinished and missing a successful head,
+  and is polled again on later downstream demand.
+- The merge is pull-based and lossless for both successes and errors.
+  Construction does not poll any input.
+- The result completes after every input completes and all retained successful
+  heads drain. An empty collection completes immediately.
+- Inputs, successful items, errors, and keys require no `Unpin`, `Send`,
+  `'static`, or `Clone` bound.
+
+Public shape:
+
+```rust
+fn try_merge_ordered<TStreams, TStream>(
+  streams: TStreams,
+) -> TryMergeOrderedStream<TStream>
+where
+  TStreams: IntoIterator<Item = TStream>,
+  TStream: TryStream,
+  TStream::Ok: Ordered;
+```
+
 ### `distinct_until_changed` and `distinct_until_changed_by`
 
 - Both operators remain pull-based.
@@ -335,6 +372,15 @@ All non-replay sharing rules also apply, with these additions:
   downstream waker across poll calls.
 - Head selection compares cached keys and must not call `order_key()` again.
 - The lower input index wins an equal-key comparison.
+- `merge_ordered` and `try_merge_ordered` share the same ordered-selection,
+  work-budget, generation, and downstream-waker state machine.
+- `try_merge_ordered` must never call `order_key()` for an error. Returning an
+  error leaves every cached successful head intact and leaves its source
+  unfinished and missing a head.
+- After an error, the current scan round is abandoned while its advanced cursor
+  is retained. The next downstream demand starts a complete scan, preventing a
+  synchronously ready error from leaving the merge pending without a wake or
+  monopolizing the cursor.
 
 ### Hot single-consumer channel
 
@@ -405,6 +451,10 @@ dimensions:
   empty inputs, completion, non-`Unpin` inputs, and cooperative large-input
   polling, including a wake from an earlier chunk and downstream waker
   replacement across chunks of a budgeted scan.
+- all ordered-merge dimensions apply to the `Ok` path of
+  `try_merge_ordered`; additionally cover observed errors bypassing a missing-
+  head barrier, retained-head preservation, continuation after errors,
+  synchronous-error fairness, and an error interrupting a budgeted scan.
 
 ## Review checklist
 

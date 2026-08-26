@@ -31,6 +31,7 @@ runtime. Their upstream streams and items require `Send + 'static`.
 | --- | --- | --- |
 | Merge homogeneous event streams | `merge_all` | Pull-based and lossless |
 | Merge streams already sorted by a canonical item key | `merge_ordered` | Pull-based and lossless; one head per unfinished input |
+| Merge fallible streams already sorted by a canonical success key | `try_merge_ordered` | Pull-based and lossless; observed errors pass through immediately |
 | Suppress consecutive duplicates | `distinct_until_changed` | Pull-based; distinct transitions remain lossless |
 | Observe only the newest state | `latest` | Hot; one unconsumed value is retained |
 | Combine the current state of several streams | `combine_latest!`, `combine_latest_all` | Hot; one unconsumed combined snapshot is retained |
@@ -123,6 +124,10 @@ Every input must already be ordered by a nondecreasing `Ordered::Key`.
 until every such input has produced a head or completed. Equal keys are emitted
 in input order. The operator does not poll upstream before downstream demand.
 
+`try_merge_ordered` applies the same ordering to the `Ok` subsequence of every
+input. Errors have no ordering key: an observed error is emitted immediately,
+does not discard retained successful heads, and does not terminate the merge.
+
 ### Bound time-based output
 
 ```rust
@@ -212,6 +217,7 @@ Creation and collection operators:
 - [`combine_latest_all`](https://docs.rs/streamx/latest/streamx/fn.combine_latest_all.html)
 - [`merge_all`](https://docs.rs/streamx/latest/streamx/fn.merge_all.html)
 - [`merge_ordered`](https://docs.rs/streamx/latest/streamx/fn.merge_ordered.html)
+- [`try_merge_ordered`](https://docs.rs/streamx/latest/streamx/fn.try_merge_ordered.html)
 
 Stream extension operators:
 

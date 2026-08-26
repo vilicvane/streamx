@@ -1,4 +1,5 @@
 use std::{
+  convert::Infallible,
   pin::Pin,
   sync::{
     Arc,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use futures::{
-  Stream,
+  Stream, TryStream,
   task::{ArcWake, AtomicWaker},
 };
 
@@ -35,13 +36,9 @@ where
   key: TItem::Key,
 }
 
-struct Input<TStream>
-where
-  TStream: Stream,
-  TStream::Item: Ordered,
-{
+struct Input<TStream, TItem: Ordered> {
   stream: Pin<Box<TStream>>,
-  head: Option<Head<TStream::Item>>,
+  head: Option<Head<TItem>>,
   done: bool,
 }
 
@@ -57,6 +54,154 @@ impl ArcWake for ScanWake {
   }
 }
 
+struct MergeOrderedCore<TStream, TItem: Ordered> {
+  inputs: Vec<Input<TStream, TItem>>,
+  missing_heads: usize,
+  poll_cursor: usize,
+  scan_remaining: usize,
+  scan_generation: usize,
+  wake_generation: Arc<AtomicUsize>,
+  downstream_waker: Arc<AtomicWaker>,
+  terminated: bool,
+}
+
+impl<TStream, TItem> MergeOrderedCore<TStream, TItem>
+where
+  TItem: Ordered,
+{
+  fn new<TStreams>(streams: TStreams) -> Self
+  where
+    TStreams: IntoIterator<Item = TStream>,
+  {
+    let inputs = streams
+      .into_iter()
+      .map(|stream| Input {
+        stream: Box::pin(stream),
+        head: None,
+        done: false,
+      })
+      .collect::<Vec<_>>();
+    let missing_heads = inputs.len();
+
+    Self {
+      inputs,
+      missing_heads,
+      poll_cursor: 0,
+      scan_remaining: 0,
+      scan_generation: 0,
+      wake_generation: Arc::new(AtomicUsize::new(0)),
+      downstream_waker: Arc::new(AtomicWaker::new()),
+      terminated: false,
+    }
+  }
+
+  fn poll_next<TError, TPoll>(
+    &mut self,
+    cx: &mut Context<'_>,
+    mut poll_input: TPoll,
+  ) -> Poll<Option<Result<TItem, TError>>>
+  where
+    TPoll: FnMut(Pin<&mut TStream>, &mut Context<'_>) -> Poll<Option<Result<TItem, TError>>>,
+  {
+    if self.terminated {
+      return Poll::Ready(None);
+    }
+
+    if self.missing_heads > 0 {
+      self.downstream_waker.register(cx.waker());
+
+      if self.scan_remaining == 0 {
+        self.scan_remaining = self.inputs.len();
+        self.scan_generation = self.wake_generation.load(Ordering::Acquire);
+      }
+
+      let input_waker = futures::task::waker(Arc::new(ScanWake {
+        generation: Arc::clone(&self.wake_generation),
+        downstream: Arc::clone(&self.downstream_waker),
+      }));
+      let mut input_cx = Context::from_waker(&input_waker);
+      let mut work = 0;
+      while self.missing_heads > 0 && self.scan_remaining > 0 && work < WORK_BUDGET {
+        let index = self.poll_cursor;
+        self.poll_cursor = (self.poll_cursor + 1) % self.inputs.len();
+        self.scan_remaining -= 1;
+        work += 1;
+
+        let input = &mut self.inputs[index];
+        if input.done || input.head.is_some() {
+          continue;
+        }
+
+        match poll_input(input.stream.as_mut(), &mut input_cx) {
+          Poll::Ready(Some(Ok(item))) => {
+            let key = item.order_key();
+            input.head = Some(Head { item, key });
+            self.missing_heads -= 1;
+          }
+          Poll::Ready(Some(Err(error))) => {
+            // An error is an output, not a head. End this logical scan so the
+            // next downstream demand starts a complete scan from the following
+            // input. Continuing a partial scan could leave this synchronously
+            // ready input missing without any registered wakeup.
+            self.scan_remaining = 0;
+            return Poll::Ready(Some(Err(error)));
+          }
+          Poll::Ready(None) => {
+            input.done = true;
+            self.missing_heads -= 1;
+          }
+          Poll::Pending => {}
+        }
+      }
+
+      if self.missing_heads > 0 {
+        let upstream_woke = self.wake_generation.load(Ordering::Acquire) != self.scan_generation;
+        if self.scan_remaining > 0 || upstream_woke {
+          cx.waker().wake_by_ref();
+        }
+        return Poll::Pending;
+      }
+
+      self.scan_remaining = 0;
+    }
+
+    let mut selected: Option<usize> = None;
+    for (index, input) in self.inputs.iter().enumerate() {
+      let Some(head) = input.head.as_ref() else {
+        continue;
+      };
+
+      let should_select = selected.is_none_or(|selected_index| {
+        let selected_head = self.inputs[selected_index]
+          .head
+          .as_ref()
+          .expect("selected input must have a head");
+        head.key < selected_head.key
+      });
+
+      if should_select {
+        selected = Some(index);
+      }
+    }
+
+    let Some(selected) = selected else {
+      self.terminated = true;
+      return Poll::Ready(None);
+    };
+
+    let head = self.inputs[selected]
+      .head
+      .take()
+      .expect("selected input must have a head");
+    self.missing_heads += 1;
+    self.poll_cursor = selected;
+    self.scan_remaining = 1;
+    self.scan_generation = self.wake_generation.load(Ordering::Acquire);
+
+    Poll::Ready(Some(Ok(head.item)))
+  }
+}
+
 /// A pull-based, lossless merge of streams ordered by [`Ordered::order_key`].
 ///
 /// Every input must already be ordered by nondecreasing key. The merge retains
@@ -68,14 +213,7 @@ where
   TStream: Stream,
   TStream::Item: Ordered,
 {
-  inputs: Vec<Input<TStream>>,
-  missing_heads: usize,
-  poll_cursor: usize,
-  scan_remaining: usize,
-  scan_generation: usize,
-  wake_generation: Arc<AtomicUsize>,
-  downstream_waker: Arc<AtomicWaker>,
-  terminated: bool,
+  core: MergeOrderedCore<TStream, TStream::Item>,
 }
 
 // Input streams are pinned independently in `Pin<Box<_>>`; no field of the
@@ -97,94 +235,20 @@ where
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     let this = self.get_mut();
 
-    if this.terminated {
-      return Poll::Ready(None);
-    }
-
-    if this.missing_heads > 0 {
-      this.downstream_waker.register(cx.waker());
-
-      if this.scan_remaining == 0 {
-        this.scan_remaining = this.inputs.len();
-        this.scan_generation = this.wake_generation.load(Ordering::Acquire);
-      }
-
-      let input_waker = futures::task::waker(Arc::new(ScanWake {
-        generation: Arc::clone(&this.wake_generation),
-        downstream: Arc::clone(&this.downstream_waker),
-      }));
-      let mut input_cx = Context::from_waker(&input_waker);
-      let mut work = 0;
-      while this.missing_heads > 0 && this.scan_remaining > 0 && work < WORK_BUDGET {
-        let index = this.poll_cursor;
-        this.poll_cursor = (this.poll_cursor + 1) % this.inputs.len();
-        this.scan_remaining -= 1;
-        work += 1;
-
-        let input = &mut this.inputs[index];
-        if input.done || input.head.is_some() {
-          continue;
+    match this
+      .core
+      .poll_next::<Infallible, _>(cx, |stream, input_cx| {
+        match Stream::poll_next(stream, input_cx) {
+          Poll::Ready(Some(item)) => Poll::Ready(Some(Ok(item))),
+          Poll::Ready(None) => Poll::Ready(None),
+          Poll::Pending => Poll::Pending,
         }
-
-        match input.stream.as_mut().poll_next(&mut input_cx) {
-          Poll::Ready(Some(item)) => {
-            let key = item.order_key();
-            input.head = Some(Head { item, key });
-            this.missing_heads -= 1;
-          }
-          Poll::Ready(None) => {
-            input.done = true;
-            this.missing_heads -= 1;
-          }
-          Poll::Pending => {}
-        }
-      }
-
-      if this.missing_heads > 0 {
-        let upstream_woke = this.wake_generation.load(Ordering::Acquire) != this.scan_generation;
-        if this.scan_remaining > 0 || upstream_woke {
-          cx.waker().wake_by_ref();
-        }
-        return Poll::Pending;
-      }
-
-      this.scan_remaining = 0;
+      }) {
+      Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
+      Poll::Ready(Some(Err(error))) => match error {},
+      Poll::Ready(None) => Poll::Ready(None),
+      Poll::Pending => Poll::Pending,
     }
-
-    let mut selected: Option<usize> = None;
-    for (index, input) in this.inputs.iter().enumerate() {
-      let Some(head) = input.head.as_ref() else {
-        continue;
-      };
-
-      let should_select = selected.is_none_or(|selected_index| {
-        let selected_head = this.inputs[selected_index]
-          .head
-          .as_ref()
-          .expect("selected input must have a head");
-        head.key < selected_head.key
-      });
-
-      if should_select {
-        selected = Some(index);
-      }
-    }
-
-    let Some(selected) = selected else {
-      this.terminated = true;
-      return Poll::Ready(None);
-    };
-
-    let head = this.inputs[selected]
-      .head
-      .take()
-      .expect("selected input must have a head");
-    this.missing_heads += 1;
-    this.poll_cursor = selected;
-    this.scan_remaining = 1;
-    this.scan_generation = this.wake_generation.load(Ordering::Acquire);
-
-    Poll::Ready(Some(head.item))
   }
 }
 
@@ -200,27 +264,8 @@ where
   TStream: Stream,
   TStream::Item: Ordered,
 {
-  let inputs = streams
-    .into_iter()
-    .map(|stream| Input {
-      stream: Box::pin(stream),
-      head: None,
-      done: false,
-    })
-    .collect::<Vec<_>>();
-  let missing_heads = inputs.len();
-  let wake_generation = Arc::new(AtomicUsize::new(0));
-  let downstream_waker = Arc::new(AtomicWaker::new());
-
   MergeOrderedStream {
-    inputs,
-    missing_heads,
-    poll_cursor: 0,
-    scan_remaining: 0,
-    scan_generation: 0,
-    wake_generation,
-    downstream_waker,
-    terminated: false,
+    core: MergeOrderedCore::new(streams),
   }
 }
 
@@ -245,6 +290,87 @@ where
   }
 }
 
+/// A pull-based, lossless ordered merge of fallible streams.
+///
+/// Successful items from every input must already be ordered by nondecreasing
+/// [`Ordered::Key`]. Errors have no ordering key: each observed error is
+/// emitted immediately, leaves retained successful heads intact, and does not
+/// terminate the merge. Only successful items participate in ordered
+/// selection.
+pub struct TryMergeOrderedStream<TStream>
+where
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+  core: MergeOrderedCore<TStream, TStream::Ok>,
+}
+
+// Input streams are pinned independently in `Pin<Box<_>>`; no field of the
+// outer stream relies on structural pinning.
+impl<TStream> Unpin for TryMergeOrderedStream<TStream>
+where
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+}
+
+impl<TStream> Stream for TryMergeOrderedStream<TStream>
+where
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+  type Item = Result<TStream::Ok, TStream::Error>;
+
+  fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    let this = self.get_mut();
+    this.core.poll_next(cx, |stream, input_cx| {
+      TryStream::try_poll_next(stream, input_cx)
+    })
+  }
+}
+
+/// Merge fallible streams whose successful items have a canonical [`Ordered`]
+/// key.
+///
+/// Each input's successful items must already be ordered by a nondecreasing
+/// key. Successful items are merged with the same ordering rules as
+/// [`merge_ordered`]. Observed errors are emitted immediately without being
+/// part of ordered selection, without discarding retained heads, and without
+/// terminating the result. No `Unpin`, `Send`, `'static`, or `Clone` bound is
+/// required.
+pub fn try_merge_ordered<TStreams, TStream>(streams: TStreams) -> TryMergeOrderedStream<TStream>
+where
+  TStreams: IntoIterator<Item = TStream>,
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+  TryMergeOrderedStream {
+    core: MergeOrderedCore::new(streams),
+  }
+}
+
+/// Extension trait that adds `.try_merge_ordered()` to collections of fallible
+/// streams.
+pub trait StreamTryMergeOrderedExt<TStream>: Sized
+where
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+  /// Merge these streams by their successful items' canonical keys.
+  fn try_merge_ordered(self) -> TryMergeOrderedStream<TStream>;
+}
+
+impl<TStreams, TStream> StreamTryMergeOrderedExt<TStream> for TStreams
+where
+  TStreams: IntoIterator<Item = TStream>,
+  TStream: TryStream,
+  TStream::Ok: Ordered,
+{
+  fn try_merge_ordered(self) -> TryMergeOrderedStream<TStream> {
+    try_merge_ordered(self)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::{
@@ -260,7 +386,9 @@ mod tests {
   use futures::{Stream, StreamExt, task::ArcWake};
   use lits::duration;
 
-  use super::{Ordered, StreamMergeOrderedExt, merge_ordered};
+  use super::{
+    Ordered, StreamMergeOrderedExt, StreamTryMergeOrderedExt, merge_ordered, try_merge_ordered,
+  };
   use crate::hot::WORK_BUDGET;
 
   #[derive(Debug, PartialEq, Eq)]
@@ -296,6 +424,9 @@ mod tests {
     Event { order, id }
   }
 
+  #[derive(Debug, PartialEq, Eq)]
+  struct TestError(&'static str);
+
   struct MpscStream<T>(tokio::sync::mpsc::UnboundedReceiver<T>);
 
   impl<T> Stream for MpscStream<T> {
@@ -330,6 +461,20 @@ mod tests {
   impl ArcWake for WakeCounter {
     fn wake_by_ref(arc_self: &Arc<Self>) {
       arc_self.0.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  struct ReadyErrorStream {
+    error: &'static str,
+    polls: Arc<AtomicUsize>,
+  }
+
+  impl Stream for ReadyErrorStream {
+    type Item = Result<Event, TestError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+      self.polls.fetch_add(1, Ordering::Relaxed);
+      Poll::Ready(Some(Err(TestError(self.error))))
     }
   }
 
@@ -550,5 +695,210 @@ mod tests {
       Pin::new(&mut merged).poll_next(&mut cx_b),
       Poll::Ready(Some(event(0, 0)))
     );
+  }
+
+  #[test]
+  fn try_free_function_merges_successes_in_nondecreasing_order() {
+    let streams = vec![
+      futures::stream::iter(vec![
+        Ok::<_, TestError>(event(1, 10)),
+        Ok(event(3, 30)),
+        Ok(event(5, 50)),
+      ]),
+      futures::stream::iter(vec![Ok(event(2, 20)), Ok(event(4, 40)), Ok(event(6, 60))]),
+    ];
+
+    let values = futures::executor::block_on(try_merge_ordered(streams).collect::<Vec<_>>());
+
+    assert_eq!(
+      values,
+      vec![
+        Ok(event(1, 10)),
+        Ok(event(2, 20)),
+        Ok(event(3, 30)),
+        Ok(event(4, 40)),
+        Ok(event(5, 50)),
+        Ok(event(6, 60)),
+      ]
+    );
+  }
+
+  #[test]
+  fn try_empty_collection_completes() {
+    let streams: Vec<futures::stream::Iter<std::vec::IntoIter<Result<Event, TestError>>>> = vec![];
+    let mut merged = streams.try_merge_ordered();
+
+    assert_eq!(futures::executor::block_on(merged.next()), None);
+    assert_eq!(futures::executor::block_on(merged.next()), None);
+  }
+
+  #[test]
+  fn try_extension_passes_errors_without_discarding_heads() {
+    let streams = vec![
+      futures::stream::iter(vec![
+        Ok(event(1, 10)),
+        Err(TestError("gap")),
+        Ok(event(3, 30)),
+      ]),
+      futures::stream::iter(vec![Ok(event(2, 20)), Ok(event(4, 40))]),
+    ];
+
+    let values = futures::executor::block_on(streams.try_merge_ordered().collect::<Vec<_>>());
+
+    assert_eq!(
+      values,
+      vec![
+        Ok(event(1, 10)),
+        Err(TestError("gap")),
+        Ok(event(2, 20)),
+        Ok(event(3, 30)),
+        Ok(event(4, 40)),
+      ]
+    );
+  }
+
+  #[test]
+  fn try_merge_continues_after_consecutive_errors() {
+    let streams = vec![
+      futures::stream::iter(vec![
+        Err(TestError("first")),
+        Err(TestError("second")),
+        Ok(event(1, 10)),
+      ]),
+      futures::stream::iter(vec![Ok(event(2, 20))]),
+    ];
+
+    let values = futures::executor::block_on(streams.try_merge_ordered().collect::<Vec<_>>());
+
+    assert_eq!(
+      values,
+      vec![
+        Err(TestError("first")),
+        Err(TestError("second")),
+        Ok(event(1, 10)),
+        Ok(event(2, 20)),
+      ]
+    );
+  }
+
+  #[tokio::test]
+  async fn try_merge_passes_an_error_through_a_missing_head_barrier() {
+    let (first_tx, first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_tx, second_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut merged = vec![MpscStream(first_rx), MpscStream(second_rx)].try_merge_ordered();
+
+    first_tx.send(Ok(event(2, 20))).unwrap();
+    assert!(
+      tokio::time::timeout(duration!("20ms"), merged.next())
+        .await
+        .is_err()
+    );
+
+    second_tx.send(Err(TestError("gap"))).unwrap();
+    assert_eq!(merged.next().await, Some(Err(TestError("gap"))));
+
+    assert!(
+      tokio::time::timeout(duration!("20ms"), merged.next())
+        .await
+        .is_err()
+    );
+
+    second_tx.send(Ok(event(1, 10))).unwrap();
+    assert_eq!(merged.next().await, Some(Ok(event(1, 10))));
+
+    drop(second_tx);
+    assert_eq!(merged.next().await, Some(Ok(event(2, 20))));
+
+    drop(first_tx);
+    assert_eq!(merged.next().await, None);
+  }
+
+  #[tokio::test]
+  async fn try_merge_scans_past_a_pending_input_for_an_error() {
+    let (_first_tx, first_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, TestError>>();
+    let (second_tx, second_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, TestError>>();
+    let mut merged = vec![MpscStream(first_rx), MpscStream(second_rx)].try_merge_ordered();
+
+    second_tx.send(Err(TestError("gap"))).unwrap();
+
+    assert_eq!(
+      tokio::time::timeout(duration!("20ms"), merged.next()).await,
+      Ok(Some(Err(TestError("gap"))))
+    );
+  }
+
+  #[test]
+  fn try_error_restarts_a_budgeted_scan() {
+    let streams = (0..=WORK_BUDGET)
+      .map(|value| {
+        if value == 0 {
+          futures::stream::iter(vec![
+            Err(TestError("gap")),
+            Ok(event(value as u32, value as u32)),
+          ])
+        } else {
+          futures::stream::iter(vec![Ok(event(value as u32, value as u32))])
+        }
+      })
+      .collect::<Vec<_>>();
+    let mut merged = streams.try_merge_ordered();
+    let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures::task::waker(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    assert_eq!(
+      Pin::new(&mut merged).poll_next(&mut cx),
+      Poll::Ready(Some(Err(TestError("gap"))))
+    );
+
+    wakes.0.store(0, Ordering::Relaxed);
+    assert!(matches!(
+      Pin::new(&mut merged).poll_next(&mut cx),
+      Poll::Pending
+    ));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+
+    assert_eq!(
+      Pin::new(&mut merged).poll_next(&mut cx),
+      Poll::Ready(Some(Ok(event(0, 0))))
+    );
+  }
+
+  #[test]
+  fn try_synchronous_errors_rotate_between_inputs() {
+    let polls = (0..3)
+      .map(|_| Arc::new(AtomicUsize::new(0)))
+      .collect::<Vec<_>>();
+    let streams = ["first", "second", "third"]
+      .into_iter()
+      .zip(&polls)
+      .map(|(error, polls)| ReadyErrorStream {
+        error,
+        polls: Arc::clone(polls),
+      })
+      .collect::<Vec<_>>();
+
+    let values =
+      futures::executor::block_on(streams.try_merge_ordered().take(3).collect::<Vec<_>>());
+
+    assert_eq!(
+      values,
+      vec![
+        Err(TestError("first")),
+        Err(TestError("second")),
+        Err(TestError("third")),
+      ]
+    );
+    assert!(polls.iter().all(|polls| polls.load(Ordering::Relaxed) == 1));
+  }
+
+  #[tokio::test]
+  async fn try_merge_accepts_non_unpin_inputs_and_non_clone_errors() {
+    let source = futures::stream::once(async { Err::<Event, _>(TestError("gap")) });
+    let mut merged = [source].try_merge_ordered();
+
+    assert_eq!(merged.next().await, Some(Err(TestError("gap"))));
+    assert_eq!(merged.next().await, None);
+    assert_eq!(merged.next().await, None);
   }
 }
