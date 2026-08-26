@@ -85,6 +85,7 @@ completed. Only `Poll::Ready(None)` is source completion.
 | `merge_all` | Downstream-driven | None beyond input streams | Lossless |
 | `merge_ordered` | Downstream-driven | One head per unfinished input | Lossless; any missing head blocks selection |
 | `try_merge_ordered` | Downstream-driven | One `Ok` head per unfinished input | Lossless; missing `Ok` heads block `Ok` selection, not observed errors |
+| `OrderGate` | Downstream-driven per member | One head per active wrapper | Lossless; missing heads block frontier advancement |
 | `distinct_until_changed(_by)` | Downstream-driven | Previous comparison item | Preserved for distinct transitions |
 | `latest` | Background task | One latest item | None |
 | `combine_latest!`, `combine_latest_all` | Background task | One latest combined snapshot | None |
@@ -307,6 +308,73 @@ where
   TStream::Ok: Ordered;
 ```
 
+### `OrderGate`
+
+- `OrderGate<K>` coordinates streams that share one `Ordered::Key = K` while
+  keeping their output streams separate. Their stream and item types may be
+  heterogeneous.
+- Every member's item sequence must already be ordered by a nondecreasing key.
+  The gate coordinates those sequences; it does not validate them.
+- Calling `gate` or `try_gate` registers the member immediately but does not
+  poll its source. Dynamic registration is allowed at any time.
+- The gate retains a monotonic frontier. It starts absent, is updated to each
+  normally selected head without moving backward, and remains retained when
+  the member set becomes empty.
+- An observed head below the current frontier passes through its own wrapper
+  immediately, independently of missing heads, and does not move the frontier.
+  This lets a dynamically registered stream catch up.
+- A head equal to the frontier is not a catch-up item. A head at or above the
+  frontier can be released only when every active member has a retained head
+  and no below-frontier head remains. The smallest head is selected, with equal
+  keys resolved by registration order.
+- Registering a member adds a missing head to that barrier. It therefore blocks
+  frontier advancement until its wrapper supplies a head, completes, or is
+  dropped; below-frontier catch-up items remain eligible during that time.
+- After releasing an item, that member is missing a head again. Its source is
+  not replenished until its own wrapper is polled again.
+- Dynamic catch-up means the values observed across all wrappers need not be
+  globally nondecreasing. Only the frontier is guaranteed not to move backward.
+- The gate is pull-based and lossless. All active wrappers must be driven by
+  their consumers; an unpolled member can block the others.
+- Completion or drop removes a member and wakes a newly eligible member. A
+  completed wrapper is fused. Dropping the `OrderGate` handle does not cancel
+  wrappers that already retain the shared state.
+- A release decision is linearized by the shared gate. The gate does not order
+  work that consumers perform after their separate `poll_next` calls return.
+- Streams, items, keys, and errors require no extra `Unpin`, `Send`, `'static`,
+  or `Clone` bound.
+
+Public shape:
+
+```rust
+struct OrderGate<K: Ord>;
+
+impl<K: Ord> OrderGate<K> {
+  fn new() -> Self;
+
+  fn gate<S>(&self, stream: S) -> OrderGatedStream<S, K>
+  where
+    S: Stream,
+    S::Item: Ordered<Key = K>;
+
+  fn try_gate<S>(&self, stream: S) -> TryOrderGatedStream<S, K>
+  where
+    S: TryStream,
+    S::Ok: Ordered<Key = K>;
+}
+```
+
+#### `try_gate`
+
+- Successful items follow all `gate` frontier, catch-up, barrier, and tie
+  rules.
+- An observed error passes through its own wrapper immediately. It does not
+  participate in ordering, move the frontier, discard another member's head,
+  or terminate membership.
+- After emitting an error, the member remains active and missing a successful
+  head. Errors have no ordering guarantee relative to outputs from other
+  wrappers.
+
 ### `distinct_until_changed` and `distinct_until_changed_by`
 
 - Both operators remain pull-based.
@@ -382,6 +450,31 @@ All non-replay sharing rules also apply, with these additions:
   synchronously ready error from leaving the merge pending without a wake or
   monopolizing the cursor.
 
+### Order gate
+
+- Each wrapper owns and polls its pinned source and retains its typed item.
+  Shared state contains only extracted keys, member states, registration ids,
+  the frontier, and per-member wake signals, allowing heterogeneous outputs.
+- A member id is monotonic and never reused. It is the stable tie-breaker for
+  equal keys.
+- Each wrapper poll performs at most one upstream poll. No upstream is polled,
+  no member is woken, and no item or key is destroyed while holding the shared
+  state lock.
+- `order_key()` is called exactly once per successful item, outside the shared
+  lock. Head comparisons use only the cached key.
+- Publishing a head and its initial eligibility check are one shared-state
+  transition. Any eventual release changes that member back to missing and
+  either advances or preserves the frontier in one later transition.
+  Registration, completion, and drop use the same synchronization boundary.
+- Each wrapper registers its current downstream waker before checking shared
+  eligibility. State changes wake the eligible member through its independent
+  signal after releasing the lock; one member cannot replace another member's
+  waker.
+- A `try_gate` error never publishes a key or changes shared membership state.
+- Removing a member updates shared membership atomically, then destroys its
+  shared key and wakes any newly eligible member after releasing the lock. A
+  retained item remains wrapper-local and is destroyed with that wrapper.
+
 ### Hot single-consumer channel
 
 `src/hot.rs` is the common driver/output mechanism for hot single-consumer
@@ -455,6 +548,15 @@ dimensions:
   `try_merge_ordered`; additionally cover observed errors bypassing a missing-
   head barrier, retained-head preservation, continuation after errors,
   synchronous-error fairness, and an error interrupting a budgeted scan.
+- order-gate separate heterogeneous outputs, registration-order ties,
+  pull-based startup, one-head retention, and missing-head barriers;
+- order-gate dynamic registration, below-frontier catch-up, equality at the
+  frontier, retained frontier with no members, and registration blocking;
+- order-gate member completion and drop, candidate wakeups, downstream-waker
+  replacement, non-`Unpin` sources, and single key extraction;
+- all order-gate dimensions apply to `try_gate` successes; additionally cover
+  immediate errors before and during catch-up, retained-head preservation, and
+  continuation after errors.
 
 ## Review checklist
 

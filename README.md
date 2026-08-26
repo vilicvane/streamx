@@ -46,6 +46,12 @@ runtime. Their upstream streams and items require `Send + 'static`.
 `hot` here means that upstream progress does not depend on downstream
 `poll_next` calls. It does not imply multicast.
 
+## Utilities
+
+| Need | Utility | Behavior |
+| --- | --- | --- |
+| Coordinate separately consumed streams by a canonical item key | [`OrderGate`](https://docs.rs/streamx/latest/streamx/struct.OrderGate.html) | Pull-based and lossless; missing heads block frontier advancement |
+
 ## Maintainers
 
 [OPERATOR_SEMANTICS.md](https://github.com/vilicvane/streamx/blob/master/OPERATOR_SEMANTICS.md)

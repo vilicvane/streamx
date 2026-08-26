@@ -15,16 +15,16 @@ use futures::{
 
 use crate::hot::WORK_BUDGET;
 
-/// An item with a canonical key used for ordered stream merging.
+/// An item with a canonical key used to coordinate ordered streams.
 ///
-/// The key is extracted once when an item becomes the current head of an input
-/// stream. Equal keys are allowed; [`merge_ordered`] resolves them by input
-/// order.
+/// [`merge_ordered`] and [`OrderGate`](crate::OrderGate) extract the key once
+/// when an item becomes a retained head. Equal keys are allowed; each operator
+/// documents its stable tie-breaker.
 pub trait Ordered {
-  /// The canonical key used to merge this item with other ordered items.
+  /// The canonical key used to order this item relative to other items.
   type Key: Ord;
 
-  /// Return this item's canonical merge key.
+  /// Return this item's canonical ordering key.
   fn order_key(&self) -> Self::Key;
 }
 
